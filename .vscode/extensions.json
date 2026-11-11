@@ -1,0 +1,38 @@
+{
+    "recommendations": [
+        //
+        //-- Used for IDE, Workbench, Tools --------------------------------------------
+        //
+        //
+        //-- Used for linters, formatters ----------------------------------------------
+        //
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.vscode-python-envs",
+        "ms-python.debugpy",
+        "charliermarsh.ruff",
+        //
+        //-- Used for: launch.json, tasks.json, launch/debug -----------------------
+        //
+        "rioj7.command-variable", //? Add files/pickers/commands variables for launch.json and tasks.json
+        "augustocdias.tasks-shell-input", //? Use shell commands as input for your tasks
+        //
+        //-- Used for: Git, Code Quality -----------------------------------------------
+        //
+        "Wequick.coverage-gutters",
+    ],
+    "unwantedRecommendations": [
+        //
+        // Avoid conflicts with extensions suggested above
+        //
+        //? Replaced by charliermarsh.ruff:
+        "ms-python.black-formatter",
+        "ms-python.autopep8",
+        "ms-python.pylint",
+        "ms-python.flake8",
+        "ms-python.mypy-type-checker",
+        "ms-python.isort",
+        //
+        //#endregion -------------------------------------------------------------------------------
+    ]
+}

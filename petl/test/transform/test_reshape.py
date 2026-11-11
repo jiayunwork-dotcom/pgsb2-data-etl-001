@@ -1,0 +1,850 @@
+from __future__ import absolute_import, print_function, division
+
+
+from datetime import datetime
+import gc
+import os
+import subprocess
+import sys
+
+import pytest
+
+from petl.errors import ArgumentError, FieldSelectionError
+from petl.test.helpers import ieq
+from petl.transform.reshape import melt, recast, transpose, pivot, flatten, \
+    unflatten
+from petl.transform.regex import split, capture
+
+
+def test_melt_1():
+
+    table = (('id', 'gender', 'age'),
+             (1, 'F', 12),
+             (2, 'M', 17),
+             (3, 'M', 16))
+
+    expectation = (('id', 'variable', 'value'),
+                   (1, 'gender', 'F'),
+                   (1, 'age', 12),
+                   (2, 'gender', 'M'),
+                   (2, 'age', 17),
+                   (3, 'gender', 'M'),
+                   (3, 'age', 16))
+
+    result = melt(table, key='id')
+    ieq(expectation, result)
+
+    # use field index as key
+    result = melt(table, key=0)
+    ieq(expectation, result)
+
+    result = melt(table, key='id', variablefield='variable', valuefield='value')
+    ieq(expectation, result)
+
+
+def test_melt_2():
+
+    table = (('id', 'time', 'height', 'weight'),
+             (1, 11, 66.4, 12.2),
+             (2, 16, 53.2, 17.3),
+             (3, 12, 34.5, 9.4))
+
+    expectation = (('id', 'time', 'variable', 'value'),
+                   (1, 11, 'height', 66.4),
+                   (1, 11, 'weight', 12.2),
+                   (2, 16, 'height', 53.2),
+                   (2, 16, 'weight', 17.3),
+                   (3, 12, 'height', 34.5),
+                   (3, 12, 'weight', 9.4))
+    result = melt(table, key=('id', 'time'))
+    ieq(expectation, result)
+
+    expectation = (('id', 'time', 'variable', 'value'),
+                   (1, 11, 'height', 66.4),
+                   (2, 16, 'height', 53.2),
+                   (3, 12, 'height', 34.5))
+    result = melt(table, key=('id', 'time'), variables='height')
+    print(result)
+    ieq(expectation, result)
+
+
+def test_melt_empty():
+    table = (('foo', 'bar', 'baz'),)
+    expect = (('foo', 'variable', 'value'),)
+    actual = melt(table, key='foo')
+    ieq(expect, actual)
+
+
+@pytest.mark.parametrize('key', [-1, ('id', -1)])
+def test_melt_negative_key(key):
+    table = [('id', 'value', 'group'), (1, 20, 'a')]
+    if key == -1:
+        expect = [('group', 'variable', 'value'),
+                  ('a', 'id', 1), ('a', 'value', 20)]
+    else:
+        expect = [('id', 'group', 'variable', 'value'),
+                  (1, 'a', 'value', 20)]
+    ieq(expect, melt(table, key=key))
+
+
+def test_melt_negative_variable():
+    table = [('id', 'value', 'group'), (1, 20, 'a')]
+    expect = [('id', 'group', 'variable', 'value'), (1, 'a', -2, 20)]
+    ieq(expect, melt(table, variables=-2))
+
+
+@pytest.mark.parametrize('hdr', [(), ('id', 'value', 'group')])
+def test_melt_missing_negative_variable(hdr):
+    expect = [hdr + ('variable', 'value')]
+    ieq(expect, melt([hdr], variables=-len(hdr) - 1))
+
+
+def test_melt_headerless():
+    table = []
+    expect = []
+    actual = melt(table, key='foo')
+    ieq(expect, actual)
+
+
+def test_melt_1_shortrow():
+
+    table = (('id', 'gender', 'age'),
+             (1, 'F', 12),
+             (2, 'M', 17),
+             (3, 'M'),
+             (4,))
+
+    expectation = (('id', 'variable', 'value'),
+                   (1, 'gender', 'F'),
+                   (1, 'age', 12),
+                   (2, 'gender', 'M'),
+                   (2, 'age', 17),
+                   (3, 'gender', 'M'))
+
+    result = melt(table, key='id')
+    ieq(expectation, result)
+
+    result = melt(table, key='id', variablefield='variable', valuefield='value')
+    ieq(expectation, result)
+
+
+def test_melt_2_shortrow():
+
+    table = (('id', 'time', 'height', 'weight'),
+             (1, 11, 66.4, 12.2),
+             (2, 16, 53.2, 17.3),
+             (3, 12, 34.5),
+             (4, 14))
+
+    expectation = (('id', 'time', 'variable', 'value'),
+                   (1, 11, 'height', 66.4),
+                   (1, 11, 'weight', 12.2),
+                   (2, 16, 'height', 53.2),
+                   (2, 16, 'weight', 17.3),
+                   (3, 12, 'height', 34.5))
+    result = melt(table, key=('id', 'time'))
+    ieq(expectation, result)
+
+    expectation = (('id', 'time', 'variable', 'value'),
+                   (1, 11, 'height', 66.4),
+                   (2, 16, 'height', 53.2),
+                   (3, 12, 'height', 34.5))
+    result = melt(table, key=('id', 'time'), variables='height')
+    ieq(expectation, result)
+
+
+def test_recast_1():
+
+    table = (('id', 'variable', 'value'),
+             (3, 'age', 16),
+             (1, 'gender', 'F'),
+             (2, 'gender', 'M'),
+             (2, 'age', 17),
+             (1, 'age', 12),
+             (3, 'gender', 'M'))
+
+    expectation = (('id', 'age', 'gender'),
+                   (1, 12, 'F'),
+                   (2, 17, 'M'),
+                   (3, 16, 'M'))
+
+    # by default lift 'variable' field, hold everything else
+    result = recast(table)
+    ieq(expectation, result)
+
+    result = recast(table, variablefield='variable')
+    ieq(expectation, result)
+
+    result = recast(table, key='id', variablefield='variable')
+    ieq(expectation, result)
+
+    result = recast(table, key='id', variablefield='variable',
+                    valuefield='value')
+    ieq(expectation, result)
+
+
+@pytest.mark.parametrize('first, second, expected_header', [
+    (2024, 'forecast', ('id', 2024, 'forecast')),
+    (None, 2024, ('id', None, 2024)),
+    (b'actual', u'forecast', ('id', b'actual', u'forecast')),
+    ('actual', 'forecast', ('id', 'actual', 'forecast')),
+    (2024, 2025, ('id', 2024, 2025)),
+])
+def test_recast_discovers_variables_of_different_types(
+        first, second, expected_header):
+    table = (('id', 'variable', 'value'),
+             ('B', second, 20),
+             ('A', second, 2),
+             ('A', first, 1),
+             ('B', first, 10))
+    expected = (expected_header, ('A', 1, 2), ('B', 10, 20))
+    actual = recast(table, key='id')
+    ieq(expected, actual)
+    ieq(expected, actual)
+
+
+def test_recast_melt_with_mixed_header_types():
+    table = (('id', 2024, 'forecast'), ('B', 10, 20), ('A', 1, 2))
+    actual = recast(melt(table, key='id'), key='id')
+    expected = (('id', 2024, 'forecast'), ('A', 1, 2), ('B', 10, 20))
+    ieq(expected, actual)
+    ieq(expected, actual)
+
+
+def test_recast_preserves_explicit_mixed_variable_order():
+    table = (('id', 'variable', 'value'),
+             ('A', 2024, 1),
+             ('A', 'forecast', 2))
+    actual = recast(table, key='id',
+                    variablefield={'variable': ['forecast', 2024]})
+    expected = (('id', 'forecast', 2024), ('A', 2, 1))
+    ieq(expected, actual)
+    ieq(expected, actual)
+
+
+def test_recast_2():
+
+    table = (('id', 'variable', 'value'),
+             (3, 'age', 16),
+             (1, 'gender', 'F'),
+             (2, 'gender', 'M'),
+             (2, 'age', 17),
+             (1, 'age', 12),
+             (3, 'gender', 'M'))
+
+    expectation = (('id', 'gender'),
+                   (1, 'F'),
+                   (2, 'M'),
+                   (3, 'M'))
+
+    # can manually pick which variables you want to recast as fields
+    # TODO this is awkward
+    result = recast(table, key='id', variablefield={'variable': ['gender']})
+    ieq(expectation, result)
+
+
+def test_recast_3():
+
+    table = (('id', 'time', 'variable', 'value'),
+             (1, 11, 'weight', 66.4),
+             (1, 14, 'weight', 55.2),
+             (2, 12, 'weight', 53.2),
+             (2, 16, 'weight', 43.3),
+             (3, 12, 'weight', 34.5),
+             (3, 17, 'weight', 49.4))
+
+    expectation = (('id', 'time', 'weight'),
+                   (1, 11, 66.4),
+                   (1, 14, 55.2),
+                   (2, 12, 53.2),
+                   (2, 16, 43.3),
+                   (3, 12, 34.5),
+                   (3, 17, 49.4))
+    result = recast(table)
+    ieq(expectation, result)
+
+    # in the absence of an aggregation function, list all values
+    expectation = (('id', 'weight'),
+                   (1, [66.4, 55.2]),
+                   (2, [53.2, 43.3]),
+                   (3, [34.5, 49.4]))
+    result = recast(table, key='id')
+    ieq(expectation, result)
+
+    # max aggregation
+    expectation = (('id', 'weight'),
+                   (1, 66.4),
+                   (2, 53.2),
+                   (3, 49.4))
+    result = recast(table, key='id', reducers={'weight': max})
+    ieq(expectation, result)
+
+    # min aggregation
+    expectation = (('id', 'weight'),
+                   (1, 55.2),
+                   (2, 43.3),
+                   (3, 34.5))
+    result = recast(table, key='id', reducers={'weight': min})
+    ieq(expectation, result)
+
+    # mean aggregation
+    expectation = (('id', 'weight'),
+                   (1, 60.80),
+                   (2, 48.25),
+                   (3, 41.95))
+
+    def mean(values):
+        return float(sum(values)) / len(values)
+
+    def meanf(precision):
+        def f(values):
+            v = mean(values)
+            v = round(v, precision)
+            return v
+        return f
+
+    result = recast(table, key='id', reducers={'weight': meanf(precision=2)})
+    ieq(expectation, result)
+
+
+def test_recast4():
+
+    # deal with missing data
+    table = (('id', 'variable', 'value'),
+             (1, 'gender', 'F'),
+             (2, 'age', 17),
+             (1, 'age', 12),
+             (3, 'gender', 'M'))
+    result = recast(table, key='id')
+    expect = (('id', 'age', 'gender'),
+              (1, 12, 'F'),
+              (2, 17, None),
+              (3, None, 'M'))
+    ieq(expect, result)
+
+
+def test_recast_empty():
+    table = (('foo', 'variable', 'value'),)
+    expect = (('foo',),)
+    actual = recast(table)
+    ieq(expect, actual)
+
+
+def test_recast_headerless():
+    table = []
+    expect = []
+    actual = recast(table)
+    ieq(expect, actual)
+
+
+
+@pytest.fixture(params=[None, 2])
+def recast_cache(request, monkeypatch, tmpdir):
+    import petl.config
+    import petl.transform.sorts as sorts
+
+    monkeypatch.setattr(petl.config, 'sort_buffersize', request.param)
+    calls = []
+    original_sort = sorts.SortView._iternocache
+    original_tempfile = sorts.NamedTemporaryFile
+
+    def counted_sort(self, *args):
+        calls.append(True)
+        return original_sort(self, *args)
+
+    def tempfile(*args, **kwargs):
+        kwargs['dir'] = str(tmpdir)
+        return original_tempfile(*args, **kwargs)
+
+    monkeypatch.setattr(sorts.SortView, '_iternocache', counted_sort)
+    monkeypatch.setattr(sorts, 'NamedTemporaryFile', tempfile)
+    return calls, str(tmpdir), request.param
+
+
+def test_recast_reuses_sort(recast_cache):
+    calls, _, _ = recast_cache
+    table = [('id', 'variable', 'value'), (2, 'a', 3), (1, 'a', 4),
+             (1, 'b', 5), (1, 'a', 6)]
+    view = recast(table, reducers={'a': sum}, missing=0)
+    expected = [('id', 'a', 'b'), (1, 10, 5), (2, 3, 0)]
+    assert [row for row in view] == expected
+    assert [row for row in view] == expected
+    assert len(calls) == 1
+
+
+def test_recast_preserves_sample(recast_cache):
+    calls, _, _ = recast_cache
+    table = [('id', 'variable', 'value'), (3, 'z', 30), (1, 'a', 10),
+             (2, 'z', 20)]
+    view = recast(table, samplesize=1)
+    expected = [('id', 'z'), (1, None), (2, 20), (3, 30)]
+    assert [row for row in view] == expected
+    assert [row for row in view] == expected
+    assert len(calls) == 1
+
+
+def test_recast_lazy_partial_read(recast_cache):
+    calls, _, _ = recast_cache
+    reads = []
+    table = [('id', 'variable', 'value'), (2, 'a', 20), (1, 'a', 10)]
+
+    class Source(object):
+        def __iter__(self):
+            reads.append(True)
+            return iter(table)
+
+    view = recast(Source())
+    it = iter(view)
+    assert reads == calls == []
+    assert next(it) == ('id', 'a')
+    assert calls == []
+    it.close()
+    first = iter(view)
+    assert next(first) == ('id', 'a')
+    assert next(first) == (1, 10)
+    reads_after_sort = len(reads)
+    second = iter(view)
+    assert next(second) == ('id', 'a')
+    assert next(second) == (1, 10)
+    assert next(first) == next(second) == (2, 20)
+    first.close()
+    second.close()
+    assert len(calls) == 1
+    assert len(reads) == reads_after_sort
+
+
+
+@pytest.mark.parametrize('combine', ['cat', 'stack', 'annex'])
+def test_recast_cache_before_data_read(recast_cache, combine):
+    import petl
+
+    calls, _, _ = recast_cache
+    table = [('id', 'variable', 'value'), (2, 'a', 20), (1, 'a', 10),
+             (3, 'a', 30)]
+    view = recast(table)
+    if combine == 'annex':
+        expected = [('id', 'a', 'id', 'a'), (1, 10, 1, 10),
+                    (2, 20, 2, 20), (3, 30, 3, 30)]
+    else:
+        expected = [('id', 'a'), (1, 10), (2, 20), (3, 30),
+                    (1, 10), (2, 20), (3, 30)]
+    combined = getattr(petl, combine)(view, view)
+    assert [row for row in combined] == expected
+    assert len(calls) == 1
+
+
+
+def test_recast_cache_with_changed_fields(recast_cache):
+    calls, _, _ = recast_cache
+    table = [('id', 'variable', 'value'), (1, 'a', 10)]
+    view = recast(table)
+    first = iter(view)
+    assert next(first) == ('id', 'a')
+    table[:] = [('id', 'variable', 'value'), (2, 'b', 20)]
+    second = iter(view)
+    assert next(second) == ('id', 'b')
+    assert next(second) == (2, 20)
+    with pytest.raises(ArgumentError, match='recast fields changed'):
+        next(first)
+    second.close()
+    assert [row for row in view] == [('id', 'b'), (2, 20)]
+    assert len(calls) == 1
+
+
+def test_recast_cached_source_changes(recast_cache):
+    table = [('id', 'variable', 'value'), (2, 'a', 20), (1, 'a', 10)]
+    view = recast(table)
+    table.append((3, 'b', 30))
+    expected = [('id', 'a', 'b'), (1, 10, None), (2, 20, None),
+                (3, None, 30)]
+    assert [row for row in view] == expected
+    table[:] = [('new_id', 'variable', 'value'), (4, 'c', 40)]
+    assert [row for row in view] == expected
+    assert [row for row in recast(table)] == [('new_id', 'c'), (4, 40)]
+
+
+@pytest.mark.parametrize('index, value, fresh_rows', [
+    (2, 99, [('id', 'a'), (1, 99), (2, 20), (3, 30)]),
+    (0, 3, [('id', 'a'), (2, 20), (3, [10, 30])]),
+    (1, 'z', [('id', 'a', 'z'), (1, None, 10), (2, 20, None),
+              (3, 30, None)]),
+])
+def test_recast_cached_row_edits(recast_cache, index, value, fresh_rows):
+    calls, _, _ = recast_cache
+    table = [['id', 'variable', 'value'], [1, 'a', 10], [2, 'a', 20],
+             [3, 'a', 30]]
+    view = recast(table)
+    expected = [('id', 'a'), (1, 10), (2, 20), (3, 30)]
+    assert [row for row in view] == expected
+    table[1][index] = value
+    assert [row for row in view] == expected
+    assert len(calls) == 1
+    assert [row for row in recast(table)] == fresh_rows
+    assert len(calls) == 2
+
+
+def test_recast_row_edits_after_partial_read(recast_cache):
+    table = [['id', 'variable', 'value'], [1, 'a', 10], [2, 'a', 20],
+             [3, 'a', 30]]
+    view = recast(table)
+    it = iter(view)
+    assert next(it) == ('id', 'a')
+    assert next(it) == (1, 10)
+    table[2][2] = 99
+    table[3][0] = 1
+    assert [row for row in it] == [(2, 20), (3, 30)]
+    assert [row for row in view] == [('id', 'a'), (1, 10), (2, 20), (3, 30)]
+
+
+def test_recast_source_reuses_row(recast_cache):
+    class Source(object):
+        def __iter__(self):
+            yield ['id', 'variable', 'value']
+            row = [None, 'a', None]
+            for key in (3, 1, 2):
+                row[0], row[2] = key, key * 10
+                yield row
+
+    view = recast(Source())
+    expected = [('id', 'a'), (1, 10), (2, 20), (3, 30)]
+    assert [row for row in view] == expected
+    assert [row for row in view] == expected
+
+
+def test_recast_cache_cleanup(recast_cache):
+    calls, directory, buffersize = recast_cache
+    table = [('id', 'variable', 'value'), (3, 'a', 30), (1, 'a', 10),
+             (2, 'a', 20), (4, 'a', 40)]
+    view = recast(table)
+    expected = [('id', 'a'), (1, 10), (2, 20), (3, 30), (4, 40)]
+    assert [row for row in view] == expected
+    files = sorted(os.listdir(directory))
+    assert bool(files) == (buffersize == 2)
+    assert [row for row in view] == expected
+    assert sorted(os.listdir(directory)) == files
+    assert len(calls) == 1
+    it = iter(view)
+    assert next(it) == expected[0]
+    assert next(it) == expected[1]
+    del view
+    gc.collect()
+    assert sorted(os.listdir(directory)) == files
+    assert [row for row in it] == expected[2:]
+    it.close()
+    del it
+    gc.collect()
+    assert os.listdir(directory) == []
+
+
+def test_recast_sort_error(recast_cache):
+    calls, directory, _ = recast_cache
+
+    class Source(object):
+        fail = True
+        rows = [('id', 'variable', 'value'), (3, 'a', 30), (1, 'a', 10),
+                (2, 'a', 20), (4, 'a', 40)]
+
+        def __iter__(self):
+            for row in self.rows:
+                yield row
+            if self.fail:
+                raise ValueError('source failed')
+
+    source = Source()
+    view = recast(source, samplesize=1)
+    with pytest.raises(ValueError, match='source failed'):
+        [row for row in view]
+    gc.collect()
+    assert os.listdir(directory) == []
+    source.fail = False
+    source.rows = [('id', 'variable', 'value'), (3, 'b', 30), (1, 'b', 10)]
+    expected = [('id', 'b'), (1, 10), (3, 30)]
+    assert [row for row in view] == expected
+    assert [row for row in view] == expected
+    assert len(calls) == 2
+
+
+def test_recast_reducer_error(recast_cache):
+    calls, _, _ = recast_cache
+
+    def fail(values):
+        raise ValueError('reducer failed')
+
+    reducers = {'a': fail}
+    table = [('id', 'variable', 'value'), (2, 'a', 20), (1, 'a', 10),
+             (1, 'a', 11)]
+    view = recast(table, reducers=reducers)
+    with pytest.raises(ValueError, match='reducer failed'):
+        [row for row in view]
+    reducers['a'] = sum
+    assert [row for row in view] == [('id', 'a'), (1, 21), (2, 20)]
+    assert len(calls) == 1
+
+
+def test_recast_validation_retry(recast_cache):
+    table = [('id', 'variable')]
+    view = recast(table)
+    with pytest.raises(ArgumentError, match='invalid value field'):
+        [row for row in view]
+    table[:] = [('id', 'variable', 'value'), (1, 'a', 10)]
+    assert [row for row in view] == [('id', 'a'), (1, 10)]
+
+
+def test_recast_empty_cache(recast_cache):
+    calls, _, _ = recast_cache
+    view = recast([('id', 'variable', 'value')])
+    assert [row for row in view] == [('id',)]
+    assert [row for row in view] == [('id',)]
+    assert len(calls) == 1
+
+
+def test_recast_date():
+
+    dt = datetime.now().replace
+    table = (('id', 'variable', 'value'),
+             (dt(hour=3), 'age', 16),
+             (dt(hour=1), 'gender', 'F'),
+             (dt(hour=2), 'gender', 'M'),
+             (dt(hour=2), 'age', 17),
+             (dt(hour=1), 'age', 12),
+             (dt(hour=3), 'gender', 'M'))
+
+    expectation = (('id', 'age', 'gender'),
+                   (dt(hour=1), 12, 'F'),
+                   (dt(hour=2), 17, 'M'),
+                   (dt(hour=3), 16, 'M'))
+
+    # by default lift 'variable' field, hold everything else
+    result = recast(table)
+    ieq(expectation, result)
+
+    result = recast(table, variablefield='variable')
+    ieq(expectation, result)
+
+    result = recast(table, key='id', variablefield='variable')
+    ieq(expectation, result)
+
+    result = recast(table, key='id', variablefield='variable',
+                    valuefield='value')
+    ieq(expectation, result)
+
+
+def test_melt_and_capture():
+
+    table = (('id', 'parad0', 'parad1', 'parad2'),
+             ('1', '12', '34', '56'),
+             ('2', '23', '45', '67'))
+
+    expectation = (('id', 'parasitaemia', 'day'),
+                   ('1', '12', '0'),
+                   ('1', '34', '1'),
+                   ('1', '56', '2'),
+                   ('2', '23', '0'),
+                   ('2', '45', '1'),
+                   ('2', '67', '2'))
+
+    step1 = melt(table, key='id', valuefield='parasitaemia')
+    step2 = capture(step1, 'variable', 'parad(\\d+)', ('day',))
+    ieq(expectation, step2)
+
+
+def test_melt_and_split():
+
+    table = (('id', 'parad0', 'parad1', 'parad2', 'tempd0', 'tempd1', 'tempd2'),
+             ('1', '12', '34', '56', '37.2', '37.4', '37.9'),
+             ('2', '23', '45', '67', '37.1', '37.8', '36.9'))
+
+    expectation = (('id', 'value', 'variable', 'day'),
+                   ('1', '12', 'para', '0'),
+                   ('1', '34', 'para', '1'),
+                   ('1', '56', 'para', '2'),
+                   ('1', '37.2', 'temp', '0'),
+                   ('1', '37.4', 'temp', '1'),
+                   ('1', '37.9', 'temp', '2'),
+                   ('2', '23', 'para', '0'),
+                   ('2', '45', 'para', '1'),
+                   ('2', '67', 'para', '2'),
+                   ('2', '37.1', 'temp', '0'),
+                   ('2', '37.8', 'temp', '1'),
+                   ('2', '36.9', 'temp', '2'))
+
+    step1 = melt(table, key='id')
+    step2 = split(step1, 'variable', 'd', ('variable', 'day'))
+    ieq(expectation, step2)
+
+
+def test_transpose():
+    table1 = (('id', 'colour'),
+              (1, 'blue'),
+              (2, 'red'),
+              (3, 'purple'),
+              (5, 'yellow'),
+              (7, 'orange'))
+    table2 = transpose(table1)
+    expect2 = (('id', 1, 2, 3, 5, 7),
+               ('colour', 'blue', 'red', 'purple', 'yellow', 'orange'))
+    ieq(expect2, table2)
+    ieq(expect2, table2)
+
+
+def test_transpose_empty():
+    table1 = (('id', 'colour'),)
+    table2 = transpose(table1)
+    expect2 = (('id',),
+               ('colour',))
+    ieq(expect2, table2)
+
+
+def test_pivot():
+
+    table1 = (('region', 'gender', 'style', 'units'),
+              ('east', 'boy', 'tee', 12),
+              ('east', 'boy', 'golf', 14),
+              ('east', 'boy', 'fancy', 7),
+              ('east', 'girl', 'tee', 3),
+              ('east', 'girl', 'golf', 8),
+              ('east', 'girl', 'fancy', 18),
+              ('west', 'boy', 'tee', 12),
+              ('west', 'boy', 'golf', 15),
+              ('west', 'boy', 'fancy', 8),
+              ('west', 'girl', 'tee', 6),
+              ('west', 'girl', 'golf', 16),
+              ('west', 'girl', 'fancy', 1))
+
+    table2 = pivot(table1, 'region', 'gender', 'units', sum)
+    expect2 = (('region', 'boy', 'girl'),
+               ('east', 33, 29),
+               ('west', 35, 23))
+    ieq(expect2, table2)
+    ieq(expect2, table2)
+
+
+def test_pivot_empty():
+
+    table1 = (('region', 'gender', 'style', 'units'),)
+    table2 = pivot(table1, 'region', 'gender', 'units', sum)
+    expect2 = (('region',),)
+    ieq(expect2, table2)
+
+
+def test_pivot_headerless():
+    table1 = []
+    with pytest.raises(FieldSelectionError):
+        for i in pivot(table1, 'region', 'gender', 'units', sum):
+            pass
+
+
+def test_flatten():
+
+    table1 = (('foo', 'bar', 'baz'),
+              ('A', 1, True),
+              ('C', 7, False),
+              ('B', 2, False),
+              ('C', 9, True))
+
+    expect1 = ('A', 1, True, 'C', 7, False, 'B', 2, False, 'C', 9, True)
+
+    actual1 = flatten(table1)
+    ieq(expect1, actual1)
+    ieq(expect1, actual1)
+
+
+def test_flatten_empty():
+
+    table1 = (('foo', 'bar', 'baz'),)
+    expect1 = []
+    actual1 = flatten(table1)
+    ieq(expect1, actual1)
+
+
+def test_flatten_headerless():
+    table1 = []
+    expect1 = []
+    actual1 = flatten(table1)
+    ieq(expect1, actual1)
+
+
+def test_unflatten():
+
+    table1 = (('lines',),
+              ('A',),
+              (1,),
+              (True,),
+              ('C',),
+              (7,),
+              (False,),
+              ('B',),
+              (2,),
+              (False,),
+              ('C',),
+              (9,))
+
+    expect1 = (('f0', 'f1', 'f2'),
+               ('A', 1, True),
+               ('C', 7, False),
+               ('B', 2, False),
+               ('C', 9, None))
+
+    actual1 = unflatten(table1, 'lines', 3)
+
+    ieq(expect1, actual1)
+    ieq(expect1, actual1)
+
+
+def test_unflatten_2():
+
+    inpt = ('A', 1, True, 'C', 7, False, 'B', 2, False, 'C', 9)
+
+    expect1 = (('f0', 'f1', 'f2'),
+               ('A', 1, True),
+               ('C', 7, False),
+               ('B', 2, False),
+               ('C', 9, None))
+
+    actual1 = unflatten(inpt, 3)
+
+    ieq(expect1, actual1)
+    ieq(expect1, actual1)
+
+
+def test_unflatten_empty():
+
+    table1 = (('lines',),)
+    expect1 = (('f0', 'f1', 'f2'),)
+    actual1 = unflatten(table1, 'lines', 3)
+    ieq(expect1, actual1)
+
+
+@pytest.mark.parametrize('header,kwargs,message', [
+    ((), {}, 'invalid value field: value'),
+    (('id', 'variable', 'value'), {'valuefield': 'missing'},
+     'invalid value field: missing'),
+    (('id', 'variable', 'value'), {'key': 'missing'},
+     'invalid key field: missing'),
+    (('id', 'variable', 'value'), {'variablefield': 'missing'},
+     'invalid variable field: missing'),
+    (('id', 'variable', 'value'), {'variablefield': {'missing': ['x']}},
+     'invalid variable field: missing'),
+    (('id', 'variable', 'value'), {'key': ['id', 'value']},
+     'value field cannot be a key field'),
+    (('id', 'variable', 'value'), {'variablefield': ['variable', 'value']},
+     'value field cannot be a variable field'),
+])
+def test_recast_invalid_fields(header, kwargs, message):
+    with pytest.raises(ArgumentError) as exc:
+        list(recast([header], **kwargs))
+    assert str(exc.value) == 'argument error: ' + message
+
+
+def test_recast_validation_with_optimization():
+    code = """
+from petl import empty, recast
+from petl.errors import ArgumentError
+try:
+    list(recast(empty()))
+except ArgumentError:
+    pass
+else:
+    raise RuntimeError('recast accepted a missing value field')
+"""
+    subprocess.check_call([sys.executable, '-O', '-c', code])
