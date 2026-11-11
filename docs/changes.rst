@@ -4,6 +4,15 @@ Changes
 Version 1.7.32
 --------------
 
+* Add an ``atomic`` option to ``todb()`` and ``appenddb()``. With
+  ``atomic=True``, standard library ``sqlite3`` loads wrap the truncate and
+  all inserts in one transaction (a SAVEPOINT when the connection already has
+  an open transaction), so source iteration errors, constraint violations and
+  SQL failures roll the whole load back while leaving caller-owned
+  transactions untouched. Only ``sqlite3`` connections, cursors, cursor
+  factories and database file paths are supported; the default behaviour is
+  unchanged when ``atomic`` is omitted or False.
+
 * Use PETL's mixed-type ordering for variable names discovered by
   ``recast()``, allowing tables with mixed-type headers to be melted and
   recast without a comparison error.

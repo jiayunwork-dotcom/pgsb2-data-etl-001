@@ -62,7 +62,7 @@ def _record_todb_create_calls(monkeypatch, drop):
         calls.append(('create', tablename))
 
     def fake_todb(table, dbo, tablename, schema=None, commit=True,
-                  truncate=False):
+                  truncate=False, atomic=False):
         calls.append(('load', tablename, truncate))
 
     monkeypatch.setattr(db, 'drop_table', fake_drop_table)
@@ -104,7 +104,7 @@ def _record_todb_truncate(monkeypatch, **kwargs):
     calls = []
 
     def fake_todb(table, dbo, tablename, schema=None, commit=True,
-                  truncate=False):
+                  truncate=False, atomic=False):
         calls.append(('load', tablename, truncate))
 
     monkeypatch.setattr(db, '_todb', fake_todb)

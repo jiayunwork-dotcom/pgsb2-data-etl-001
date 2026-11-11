@@ -3,7 +3,9 @@ from __future__ import absolute_import, print_function, division
 
 
 # standard library dependencies
+import itertools
 import logging
+import threading
 from petl.compat import next, text_type, string_types
 
 
@@ -20,6 +22,35 @@ from petl.io.db_create import drop_table, create_table
 logger = logging.getLogger(__name__)
 debug = logger.debug
 warning = logger.warning
+
+
+# Counter used to give every atomic load unique SAVEPOINT names, so that
+# nested atomic loads on the same connection cannot overwrite each other's
+# savepoints.
+_savepoint_counter = itertools.count(1)
+_savepoint_lock = threading.Lock()
+
+
+def _next_savepoint_name():
+    with _savepoint_lock:
+        number = next(_savepoint_counter)
+    return 'petl_sp_%d' % number
+
+
+def _is_sqlite3_connection(dbo):
+    try:
+        import sqlite3
+    except ImportError:
+        return False
+    return isinstance(dbo, sqlite3.Connection)
+
+
+def _is_sqlite3_cursor(dbo):
+    try:
+        import sqlite3
+    except ImportError:
+        return False
+    return isinstance(dbo, sqlite3.Cursor)
 
 
 def fromdb(dbo, query, *args, **kwargs):
@@ -233,7 +264,7 @@ def _iter_sqlalchemy_session(session, query, *args, **kwargs):
 
 def todb(table, dbo, tablename, schema=None, commit=True,
          create=False, drop=False, constraints=True, metadata=None,
-         dialect=None, sample=1000, truncate=True):
+         dialect=None, sample=1000, truncate=True, atomic=False):
     """
     Load data into an existing database table via a DB-API 2.0
     connection or cursor. By default the database table will be truncated,
@@ -323,6 +354,69 @@ def todb(table, dbo, tablename, schema=None, commit=True,
         If True (the default) truncate the table before loading, deleting any
         existing rows. Set to False to keep existing rows and append the new
         data instead.
+    atomic : bool
+        If True, wrap the truncate and all inserts in a single SQLite
+        transaction so that a source iteration error, constraint violation or
+        SQL failure rolls the whole load back, restoring the previous table
+        contents. Only standard library :mod:`sqlite3` objects are supported:
+        a ``sqlite3.Connection`` (including subclasses), a borrowed
+        ``sqlite3.Cursor``, a callable returning a ``sqlite3.Cursor``, or a
+        string path to a SQLite database file. See the "Atomic SQLite loads"
+        section below for the full transaction ownership contract. Defaults
+        to False, which preserves the historical non-atomic behaviour.
+
+    Atomic SQLite loads
+    ^^^^^^^^^^^^^^^^^^^
+
+    Pass ``atomic=True`` to make the load atomic when using a standard
+    library :mod:`sqlite3` database::
+
+        >>> import sqlite3
+        >>> import petl as etl
+        >>> connection = sqlite3.connect('example.db')
+        >>> # table "foobar" already exists and may contain data
+        ... etl.todb(table, connection, 'foobar', atomic=True)
+
+    The truncate (``todb`` only) and every insert run inside one SQLite
+    transaction boundary. If iterating the source table raises, a unique or
+    NOT NULL constraint fails, or any SQL statement errors, all writes made
+    by this load are undone and the original error propagates unchanged; bad
+    rows are never skipped and rows are never committed one at a time. The
+    source is still consumed lazily in a single pass, so the full batch is
+    never materialised in memory.
+
+    Transaction ownership follows the state of the connection on entry:
+
+    * If the connection already has an open transaction (including
+      ``isolation_level=None`` autocommit connections after an explicit
+      ``BEGIN``, or a caller-created SAVEPOINT), the load runs inside a new
+      SAVEPOINT. On success the SAVEPOINT is released but nothing is
+      committed, regardless of ``commit``; on failure only the load is rolled
+      back to the SAVEPOINT, leaving the caller's earlier writes and
+      SAVEPOINTs intact. Nested atomic loads are supported and use distinct
+      SAVEPOINTs, so an outer rollback also undoes inner loads.
+    * If the connection has no open transaction, petl opens one for the load.
+      With ``commit=True`` (the default) it is committed after a successful
+      load and rolled back on failure, leaving the connection without an
+      active transaction again. With ``commit=False`` the transaction is left
+      open on success for the caller to commit or roll back; on failure it is
+      rolled back so the connection returns to its entry state. This applies
+      to both the default transaction handling and ``isolation_level=None``.
+
+    Cursors created by petl are closed on both success and failure; a cursor
+    supplied directly by the caller and the connection itself are left open
+    and usable. Cleanup errors never replace the original load exception.
+
+    When ``dbo`` is a file path string, petl opens and owns the connection and
+    closes it again when the call returns. Because an uncommitted load would
+    be silently lost when that connection closes, ``atomic=True`` with
+    ``commit=False`` is rejected with an :class:`petl.errors.ArgumentError`
+    before any data is read.
+
+    ``atomic=True`` cannot be combined with ``create=True`` (including
+    ``drop=True``) and is not supported for non-sqlite3 DB-API drivers or
+    SQLAlchemy objects; such calls raise :class:`petl.errors.ArgumentError`
+    before any rows are consumed or written.
 
     .. note::
 
@@ -360,6 +454,21 @@ def todb(table, dbo, tablename, schema=None, commit=True,
 
     needs_closing = False
 
+    # atomic mode is only implemented for the standard library sqlite3 driver
+    if atomic:
+        if create:
+            raise ArgumentError(
+                'atomic=True is not supported with create=True (including '
+                'drop=True)')
+        # a connection owned by petl is closed at the end of this call, so an
+        # uncommitted atomic load would be silently lost
+        if isinstance(dbo, string_types) and not commit:
+            raise ArgumentError(
+                'atomic=True with commit=False is not supported when dbo is '
+                'a SQLite file path: petl closes the connection it opens, so '
+                'uncommitted data would be lost; pass commit=True or supply '
+                'your own sqlite3 connection')
+
     # convenience for working with sqlite3
     if isinstance(dbo, string_types):
         import sqlite3
@@ -376,7 +485,7 @@ def todb(table, dbo, tablename, schema=None, commit=True,
                          constraints=constraints, metadata=metadata,
                          dialect=dialect, sample=sample)
         _todb(table, dbo, tablename, schema=schema, commit=commit,
-              truncate=truncate)
+              truncate=truncate, atomic=atomic)
 
     finally:
         if needs_closing:
@@ -386,7 +495,14 @@ def todb(table, dbo, tablename, schema=None, commit=True,
 Table.todb = todb
 
 
-def _todb(table, dbo, tablename, schema=None, commit=True, truncate=False):
+def _todb(table, dbo, tablename, schema=None, commit=True, truncate=False,
+          atomic=False):
+
+    # atomic mode only supports the standard library sqlite3 driver
+    if atomic:
+        _todb_sqlite3_atomic(table, dbo, tablename, schema=schema,
+                             commit=commit, truncate=truncate)
+        return
 
     # need to deal with polymorphic dbo argument
     # what sort of duck is it?
@@ -448,6 +564,153 @@ def _close_load_cursor(cursor, load_failed):
         if not load_failed:
             raise
         debug('could not close cursor after failed load', exc_info=True)
+
+
+def _todb_sqlite3_atomic(table, dbo, tablename, schema=None, commit=True,
+                         truncate=False):
+    """Atomic load for standard library sqlite3 connections only.
+
+    The truncate and the whole insert are wrapped in a single transaction
+    boundary: a SAVEPOINT when the caller already owns a transaction, or a
+    fresh transaction otherwise. Any failure rolls back exactly this load
+    without touching the caller's outer transaction.
+    """
+
+    owns_cursor = False
+    if _is_sqlite3_connection(dbo):
+        connection = dbo
+        cursor = connection.cursor()
+        owns_cursor = True
+    elif _is_sqlite3_cursor(dbo):
+        cursor = dbo
+        connection = cursor.connection
+    elif callable(dbo):
+        # the factory contract is one new cursor per call
+        cursor = dbo()
+        if not _is_sqlite3_cursor(cursor):
+            # reject before any writes or row consumption, but release the
+            # resource that this call just created, if any
+            if cursor is not None and hasattr(cursor, 'close'):
+                try:
+                    cursor.close()
+                except Exception:
+                    debug('could not close non-sqlite3 factory cursor',
+                          exc_info=True)
+            raise ArgumentError(
+                'atomic=True requires a standard library sqlite3 cursor, '
+                'factory returned: %r' % cursor)
+        connection = cursor.connection
+        owns_cursor = True
+    else:
+        raise ArgumentError(
+            'atomic=True is only supported for standard library sqlite3 '
+            'connections, cursors, cursor factories and SQLite file paths, '
+            'unsupported database object type: %r' % dbo)
+
+    # sanitise table name
+    quoted_tablename = _quote(tablename)
+    if schema is not None:
+        quoted_tablename = _quote(schema) + '.' + quoted_tablename
+    debug('tablename: %r', quoted_tablename)
+
+    # decide where the transaction boundary sits before touching any data
+    outer_transaction = _sqlite3_in_transaction(connection)
+    savepoint = None
+    tx_cursor = None
+    load_failed = True
+    try:
+        # sanitise field names (may itself fail on a broken source; the
+        # cursors we created must still be released)
+        it = iter(table)
+        hdr = next(it)
+        flds = list(map(text_type, hdr))
+        colnames = [_quote(n) for n in flds]
+        debug('column names: %r', colnames)
+
+        # sqlite3 uses the qmark paramstyle
+        placeholders = _placeholders(connection, colnames)
+        debug('placeholders: %r', placeholders)
+
+        tx_cursor = connection.cursor()
+        if outer_transaction:
+            # nest inside the caller's transaction; never commit or roll it
+            # back, and use a unique name so nested loads do not collide
+            savepoint = _next_savepoint_name()
+            debug('atomic load inside existing transaction, savepoint %r',
+                  savepoint)
+            tx_cursor.execute('SAVEPOINT %s' % savepoint)
+        else:
+            # open a transaction ourselves; works both with the default
+            # isolation handling and with isolation_level=None
+            debug('atomic load opens a new transaction')
+            tx_cursor.execute('BEGIN')
+
+        try:
+            if truncate:
+                truncatequery = SQL_TRUNCATE_QUERY % quoted_tablename
+                debug('truncate the table via query %r', truncatequery)
+                cursor.execute(truncatequery)
+
+            insertcolnames = ', '.join(colnames)
+            insertquery = SQL_INSERT_QUERY % (quoted_tablename,
+                                              insertcolnames, placeholders)
+            debug('insert data via query %r' % insertquery)
+            # executemany consumes the source iterator lazily in one pass
+            cursor.executemany(insertquery, it)
+        except BaseException:
+            # undo exactly this load, preserving any outer transaction;
+            # a rollback failure must not mask the original load error
+            _sqlite3_undo_load(tx_cursor, savepoint)
+            raise
+        else:
+            if savepoint is not None:
+                # leave the caller's transaction open for its own
+                # commit/rollback; commit is intentionally ignored here
+                debug('release savepoint %r after successful atomic load',
+                      savepoint)
+                tx_cursor.execute('RELEASE %s' % savepoint)
+            elif commit:
+                debug('commit transaction after successful atomic load')
+                tx_cursor.execute('COMMIT')
+            # else: leave the transaction we opened uncommitted for the caller
+        load_failed = False
+    finally:
+        # always release the transaction cursor we created; a borrowed data
+        # cursor and the connection stay open for the caller
+        if tx_cursor is not None:
+            try:
+                tx_cursor.close()
+            except Exception:
+                if not load_failed:
+                    raise
+                debug('could not close transaction cursor after failed load',
+                      exc_info=True)
+        if owns_cursor:
+            debug('close the load cursor')
+            _close_load_cursor(cursor, load_failed)
+
+
+def _sqlite3_undo_load(tx_cursor, savepoint):
+    try:
+        if savepoint is not None:
+            debug('roll back savepoint %r after failed atomic load',
+                  savepoint)
+            tx_cursor.execute('ROLLBACK TO %s' % savepoint)
+            tx_cursor.execute('RELEASE %s' % savepoint)
+        else:
+            debug('roll back transaction after failed atomic load')
+            tx_cursor.execute('ROLLBACK')
+    except BaseException:
+        debug('could not roll back failed atomic load', exc_info=True)
+
+
+def _sqlite3_in_transaction(connection):
+    # sqlite3.Connection.in_transaction reports whether the driver currently
+    # holds an open transaction (including a caller-created SAVEPOINT)
+    in_transaction = getattr(connection, 'in_transaction', None)
+    if in_transaction is None:
+        return False
+    return bool(in_transaction)
 
 
 def _todb_dbapi_connection(table, connection, tablename, schema=None,
@@ -715,16 +978,30 @@ def _todb_sqlalchemy_session(table, session, tablename, schema=None,
                                     truncate=truncate)
 
 
-def appenddb(table, dbo, tablename, schema=None, commit=True):
+def appenddb(table, dbo, tablename, schema=None, commit=True, atomic=False):
     """
     Load data into an existing database table via a DB-API 2.0
     connection or cursor. As :func:`petl.io.db.todb` except that the database
     table will be appended, i.e., the new data will be inserted into the
     table, and any existing rows will remain.
 
+    Pass ``atomic=True`` for an atomic load backed by standard library
+    :mod:`sqlite3`; see :func:`petl.io.db.todb` for the full transaction
+    ownership, supported object and failure contracts. Defaults to False,
+    preserving the historical non-atomic behaviour.
+
     """
 
     needs_closing = False
+
+    if atomic and isinstance(dbo, string_types) and not commit:
+        # a connection owned by petl is closed at the end of this call, so an
+        # uncommitted atomic load would be silently lost
+        raise ArgumentError(
+            'atomic=True with commit=False is not supported when dbo is '
+            'a SQLite file path: petl closes the connection it opens, so '
+            'uncommitted data would be lost; pass commit=True or supply '
+            'your own sqlite3 connection')
 
     # convenience for working with sqlite3
     if isinstance(dbo, string_types):
@@ -734,7 +1011,7 @@ def appenddb(table, dbo, tablename, schema=None, commit=True):
 
     try:
         _todb(table, dbo, tablename, schema=schema, commit=commit,
-              truncate=False)
+              truncate=False, atomic=atomic)
 
     finally:
         if needs_closing:

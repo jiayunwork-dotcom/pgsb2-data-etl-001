@@ -464,6 +464,58 @@ transaction, pass a connection or session rather than an engine. If iteration
 over ``fromdb()`` is interrupted, close its iterator to release its result and
 any connection it opened. Supplied connections and sessions remain open.
 
+Atomic SQLite loads
+^^^^^^^^^^^^^^^^^^^
+
+``todb()`` and ``appenddb()`` normally leave transaction control to the
+underlying driver: a failure partway through a load can leave a half-deleted,
+half-inserted table in the connection's open transaction. Pass
+``atomic=True`` to make a load all-or-nothing when using the standard
+library :mod:`sqlite3` module. Supported database objects are a
+``sqlite3.Connection`` (including subclasses), a borrowed
+``sqlite3.Cursor``, a callable returning a ``sqlite3.Cursor``, or a string
+path to a SQLite database file. Other DB-API drivers, SQLAlchemy objects and
+``create=True`` (including ``drop=True``) are rejected with an
+:class:`petl.errors.ArgumentError` before any rows are consumed::
+
+    import sqlite3
+    import petl as etl
+
+    connection = sqlite3.connect('example.db')
+    # either the whole replacement happens, or the old rows are preserved
+    etl.todb(table, connection, 'example', atomic=True)
+
+The source is still streamed in a single lazy pass; it is never converted to
+a list first. If the source raises while being iterated, that exception
+propagates unchanged and the table is restored to its previous contents.
+
+When the connection already has an open transaction, the load runs inside a
+new SAVEPOINT: success leaves the writes uncommitted for the caller and
+failure undoes only this load, regardless of the ``commit`` argument. This
+makes atomic loads composable with an application-owned transaction and with
+nested atomic loads on the same connection::
+
+    connection = sqlite3.connect('example.db')
+    try:
+        with connection:  # caller owns the outer transaction
+            register_batch(connection)           # application statement
+            etl.todb(table, connection, 'example',
+                     atomic=True, commit=False)  # savepoint-scoped load
+            etl.appenddb(more_rows, connection, 'audit',
+                         atomic=True, commit=False)
+    except Exception:
+        # a failed load has already rolled back to its savepoint; the
+        # application decides what to do with its outer transaction
+        raise
+
+With no transaction open on entry, ``commit=True`` commits a successful load
+and rolls back a failed one (under both the default isolation handling and
+``isolation_level=None``); ``commit=False`` leaves the load's transaction
+open for the caller on success and restores the no-transaction state on
+failure. A file path connection is owned and closed by petl, so
+``atomic=True`` with ``commit=False`` is rejected up front rather than
+silently discarding an uncommitted load.
+
 .. autofunction:: petl.io.db.fromdb
 .. autofunction:: petl.io.db.todb
 .. autofunction:: petl.io.db.appenddb
