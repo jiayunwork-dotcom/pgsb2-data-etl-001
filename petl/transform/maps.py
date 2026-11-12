@@ -1,8 +1,15 @@
 from __future__ import absolute_import, print_function, division
 
 
+import heapq
+import math
+import numbers
 import operator
-from collections import OrderedDict
+import queue
+import threading
+import time
+import weakref
+from collections import OrderedDict, namedtuple
 from petl.compat import next, string_types, text_type
 
 
@@ -376,3 +383,483 @@ def iterrowgroupmap(source, key, mapper, header):
     for key, rows in rowgroupby(source, key):
         for row in mapper(key, rows):
             yield row
+
+
+def rowmapconcurrent(table, rowmapper, header, workers=4, maxpending=None,
+                     ordered=True, retry_on=(), retry_delays=()):
+    """
+    Transform rows via an arbitrary function, running the function
+    concurrently in worker threads. Useful when `rowmapper` spends most of
+    its time waiting on external services (e.g. HTTP APIs or database
+    lookups) and would otherwise process rows one at a time. E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['id', 'sex', 'age'],
+        ...           [1, 'male', 16],
+        ...           [2, 'female', 19],
+        ...           [3, 'female', 17],
+        ...           [4, 'male', 21],
+        ...           [5, '-', 25]]
+        >>> def rowmapper(row):
+        ...     transmf = {'male': 'M', 'female': 'F'}
+        ...     return [row[0],
+        ...             transmf[row['sex']] if row['sex'] in transmf else None,
+        ...             row.age * 12]
+        ...
+        >>> table2 = etl.rowmapconcurrent(table1, rowmapper,
+        ...                               header=['subject_id', 'gender',
+        ...                                       'age_months'],
+        ...                               workers=4)
+        >>> table2
+        +------------+--------+------------+
+        | subject_id | gender | age_months |
+        +============+========+============+
+        |          1 | 'M'    |        192 |
+        +------------+--------+------------+
+        |          2 | 'F'    |        228 |
+        +------------+--------+------------+
+        |          3 | 'F'    |        204 |
+        +------------+--------+------------+
+        |          4 | 'M'    |        252 |
+        +------------+--------+------------+
+        |          5 | None   |        300 |
+        +------------+--------+------------+
+
+    The `rowmapper` function is used in the same way as with
+    :func:`petl.transform.maps.rowmap`: it receives a single row as a
+    :class:`petl.util.base.Record` and must return a sequence (list or
+    tuple) whose length equals the length of `header`. If the returned
+    value is not a sequence or its length does not match, the row fails
+    with an :class:`petl.errors.ArgumentError` carrying the one-based data
+    row number (the first row after the table header is row 1); this
+    failure is never retried.
+
+    The output header is ``tuple(header)``.
+
+    `workers` is the maximum number of `rowmapper` calls executing at the
+    same time. It must be a positive integer (booleans are rejected) and
+    the work is carried out by threads, never by separate processes.
+
+    `maxpending` bounds the number of rows that have been pulled from the
+    source table but not yet handed to the caller, including rows currently
+    being mapped, rows waiting for a retry, and rows whose result is ready
+    but waiting for earlier rows (in ordered mode). If ``None``, it
+    defaults to ``2 * workers``. It must be a positive integer (booleans
+    are rejected). Because the window is bounded, memory does not grow with
+    the total number of input rows.
+
+    If `ordered` is true (the default), output rows are delivered in the
+    same order as the input rows: a row is delivered as soon as it and all
+    rows before it have finished, without waiting for the whole window to
+    fill. If `ordered` is false, rows are delivered in completion order and
+    every successful row appears exactly once.
+
+    `retry_on` is a tuple of exception classes (subclasses of
+    :class:`Exception`); when `rowmapper` raises an instance of one of
+    them, the row is retried. `retry_delays` is a sequence of non-negative
+    finite numbers; its length is the maximum number of retries and the
+    k-th retry (one-based) waits ``retry_delays[k - 1]`` seconds before
+    running again. Retry waits do not occupy a worker thread, so with
+    ``workers=1`` other rows can still be processed while a row is waiting
+    to be retried. In ordered mode, a retried row keeps its original
+    position. Any other exception, or exhausting the retries, makes the
+    row fail.
+
+    Failure semantics differ by mode:
+
+    * with `ordered` true, all results before the failing row are delivered
+      first, then the original exception object is raised at the failing
+      row's position;
+    * with `ordered` false, results that finished before the failure are
+      delivered in completion order, then the original exception object is
+      raised; results that finish afterwards are never delivered.
+
+    After a failure no more rows are pulled from the source, no new
+    `rowmapper` calls are started and scheduled retries are cancelled;
+    further ``next()`` calls end the iteration. :class:`BaseException`
+    raised by `rowmapper` (e.g. :class:`KeyboardInterrupt`,
+    :class:`SystemExit`) is never retried and is re-raised in the caller
+    thread.
+
+    The source table is only advanced in the thread that calls ``next()``
+    on the result iterator, so thread-affine sources such as
+    :mod:`sqlite3` cursors are safe; worker threads only execute
+    `rowmapper`.
+
+    Iteration cleans up (worker threads exit, pending retries are
+    cancelled and the source iterator is closed if it supports ``close()``)
+    on normal exhaustion, on failure, when the result iterator's
+    ``close()`` is called, when the caller thread receives a
+    :class:`KeyboardInterrupt` inside ``next()``, and when an unread
+    iterator is garbage collected. Iterators created from the same view
+    are independent and each creates its own threads.
+
+    Invalid parameters raise :class:`petl.errors.ArgumentError` when the
+    view is created, before the source table is touched.
+
+    """
+
+    return RowMapConcurrentView(table, rowmapper, header, workers=workers,
+                                maxpending=maxpending, ordered=ordered,
+                                retry_on=retry_on, retry_delays=retry_delays)
+
+
+Table.rowmapconcurrent = rowmapconcurrent
+
+
+def _positive_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ArgumentError(
+            '%s must be a positive integer, got %r' % (name, value))
+    return value
+
+
+class RowMapConcurrentView(Table):
+
+    def __init__(self, source, rowmapper, header, workers=4, maxpending=None,
+                 ordered=True, retry_on=(), retry_delays=()):
+        # all parameter errors are raised here, without touching the source
+        workers = _positive_int(workers, 'workers')
+        if maxpending is None:
+            maxpending = 2 * workers
+        else:
+            maxpending = _positive_int(maxpending, 'maxpending')
+        if not isinstance(retry_on, tuple):
+            raise ArgumentError(
+                'retry_on must be a tuple of Exception subclasses, got %r'
+                % (retry_on,))
+        for exc_type in retry_on:
+            if not isinstance(exc_type, type) or not issubclass(exc_type,
+                                                                Exception):
+                raise ArgumentError(
+                    'retry_on must contain only Exception subclasses, got %r'
+                    % (exc_type,))
+        delays = tuple(retry_delays)
+        for delay in delays:
+            if isinstance(delay, bool) or not isinstance(delay, numbers.Real) \
+                    or delay < 0 or not math.isfinite(delay):
+                raise ArgumentError(
+                    'retry_delays must be a sequence of non-negative finite '
+                    'numbers, got %r' % (delay,))
+
+        self.source = source
+        self.rowmapper = rowmapper
+        self._header = tuple(header)
+        self.workers = workers
+        self.maxpending = maxpending
+        self.ordered = ordered
+        self.retry_on = retry_on
+        self.retry_delays = delays
+
+    def __iter__(self):
+        return _RowMapConcurrentIterator(self)
+
+
+_Success = namedtuple('_Success', ('index', 'row'))
+_Failure = namedtuple('_Failure', ('index', 'error'))
+# job queue sentinel: a worker that pulls this exits
+_SENTINEL = object()
+# result queue sentinel: the iterator has been closed
+_CLOSED = object()
+
+
+class _ConcurrentState(object):
+    """All mutable runtime state of a concurrent iteration. Kept separate from
+    the iterator object so the garbage-collection finalizer only needs to
+    reference this state, never the iterator itself: an abandoned iterator
+    with running worker threads can then still be collected."""
+
+    def __init__(self, view):
+        self.view = view
+        self.rowmapper = view.rowmapper
+        self.header = view._header
+        self.workers = view.workers
+        self.maxpending = view.maxpending
+        self.ordered = view.ordered
+        self.retry_on = view.retry_on
+        self.retry_delays = view.retry_delays
+        self.nfields = len(view._header)
+
+        self.source = None
+        self.flds = None
+        self.header_emitted = False
+        self.started = False
+        self.closed = False
+        self.source_exhausted = False
+        self.row_number = 0        # one-based data row number
+        self.next_index = 0        # index of the next row to pull
+        self.inflight = 0          # rows pulled but not yet delivered
+
+        self.job_queue = queue.Queue()
+        self.results = queue.Queue()
+
+        # ordered mode: results waiting for earlier rows, keyed by index
+        self.buffer = {}
+        self.deliver_index = 0
+
+        # retry scheduling
+        self.timer_cond = threading.Condition(threading.Lock())
+        self.retry_heap = []       # (due_time, sequence, job)
+        self.retry_seq = 0
+
+        self.closing = threading.Event()
+        self.threads = []
+
+
+def _teardown_state(state):
+    if state.closed:
+        return
+    state.closed = True
+    state.closing.set()
+    if state.started:
+        # wake the retry timer so any waiting retry is cancelled at once;
+        # workers discard queued jobs without calling rowmapper once closing
+        # is set, then exit on their sentinel
+        with state.timer_cond:
+            state.timer_cond.notify_all()
+        for _ in range(state.workers):
+            state.job_queue.put(_SENTINEL)
+        # join without a timeout: before this returns every in-flight
+        # rowmapper call must have finished and every thread must exit
+        for t in state.threads:
+            t.join()
+    source = state.source
+    if source is not None and hasattr(source, 'close'):
+        try:
+            source.close()
+        except Exception:
+            pass
+    # unblock any consumer still waiting on results (defensive)
+    state.results.put(_CLOSED)
+
+
+class _RowMapConcurrentIterator(object):
+    """Iterator driving the worker pool. The source table is only ever
+    advanced in the thread that owns this object."""
+
+    def __init__(self, view):
+        self._state = _ConcurrentState(view)
+        # the finalizer captures only the state, never `self`, so garbage
+        # collection of an abandoned iterator still triggers cleanup
+        self._finalizer = weakref.finalize(
+            self, _teardown_state, self._state)
+
+    # ------------------------------------------------------------------
+    # iterator protocol
+    # ------------------------------------------------------------------
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        state = self._state
+        if state.closed:
+            raise StopIteration
+        if not state.header_emitted:
+            # first next(): read the header in the caller thread; no threads
+            # are started and the source is not touched before this point
+            try:
+                state.source = iter(state.view.source)
+                hdr = next(state.source)
+            except StopIteration:
+                self._finalizer()
+                raise
+            except BaseException:
+                self._finalizer()
+                raise
+            state.flds = list(map(text_type, hdr))
+            state.header_emitted = True
+            return state.header
+        if not state.started:
+            self._start()
+        try:
+            return self._next_row()
+        except BaseException:
+            # includes failure exceptions and KeyboardInterrupt in the caller
+            self._finalizer()
+            raise
+
+    # python 2 compatibility shim (harmless on python 3)
+    next = __next__
+
+    def close(self):
+        self._finalizer()
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+
+    def _start(self):
+        state = self._state
+        state.started = True
+        # module-level targets hold only a weak reference to the state, so a
+        # running thread never keeps the iterator (or anything reachable from
+        # it) alive on its own
+        state_ref = weakref.ref(state)
+        for i in range(state.workers):
+            t = threading.Thread(target=_rowmap_worker, args=(state_ref,),
+                                 name='petl-rowmapconcurrent-%d' % i)
+            t.daemon = True
+            state.threads.append(t)
+            t.start()
+        timer = threading.Thread(target=_retry_timer, args=(state_ref,),
+                                 name='petl-rowmapconcurrent-timer')
+        timer.daemon = True
+        state.threads.append(timer)
+        timer.start()
+
+    # ------------------------------------------------------------------
+    # caller-side scheduling: source is only advanced here
+    # ------------------------------------------------------------------
+
+    def _pump(self):
+        """Pull rows from the source and submit them until the pending
+        window is full, the source is exhausted or the iterator is closing.
+        """
+        state = self._state
+        while state.inflight < state.maxpending \
+                and not state.source_exhausted \
+                and not state.closing.is_set():
+            try:
+                raw_row = next(state.source)
+            except StopIteration:
+                state.source_exhausted = True
+                return
+            state.row_number += 1
+            record = Record(raw_row, state.flds)
+            index = state.next_index
+            state.next_index += 1
+            state.inflight += 1
+            state.job_queue.put((index, state.row_number, record, 0))
+
+    def _next_row(self):
+        if self._state.ordered:
+            return self._next_ordered()
+        return self._next_unordered()
+
+    def _next_unordered(self):
+        state = self._state
+        self._pump()
+        if state.source_exhausted and state.inflight == 0:
+            raise StopIteration
+        outcome = state.results.get()
+        if outcome is _CLOSED:
+            raise StopIteration
+        state.inflight -= 1
+        if isinstance(outcome, _Failure):
+            # results already finished were queued ahead of this failure and
+            # have either been delivered or will be discarded; tear down,
+            # then raise the original exception object
+            self._finalizer()
+            raise outcome.error
+        self._pump()
+        return outcome.row
+
+    def _next_ordered(self):
+        state = self._state
+        while True:
+            self._pump()
+            ready = state.buffer.pop(state.deliver_index, None)
+            if ready is not None:
+                state.deliver_index += 1
+                state.inflight -= 1
+                if isinstance(ready, _Failure):
+                    self._finalizer()
+                    raise ready.error
+                return ready.row
+            if state.source_exhausted and state.inflight == 0:
+                raise StopIteration
+            outcome = state.results.get()
+            if outcome is _CLOSED:
+                raise StopIteration
+            state.buffer[outcome.index] = outcome
+
+
+def _rowmap_worker(state_ref):
+    """Worker thread entry point. Holds only a weak reference to the runtime
+    state, so abandoning the iterator lets garbage collection run its
+    finalizer even while a call is still in flight."""
+    while True:
+        state = state_ref()
+        if state is None:
+            # the state was garbage collected; nothing else can enqueue work
+            return
+        job = state.job_queue.get()
+        if job is _SENTINEL:
+            return
+        if state.closing.is_set():
+            # teardown in progress: drop the job, no new rowmapper call
+            continue
+        index, row_number, record, attempt = job
+        try:
+            outrow = state.rowmapper(record)
+            try:
+                if len(outrow) != state.nfields:
+                    error = ArgumentError(
+                        'rowmapper returned %d values for row %d but '
+                        'header has %d fields'
+                        % (len(outrow), row_number, state.nfields))
+                    error._petl_no_retry = True
+                    raise error
+            except TypeError:
+                error = ArgumentError(
+                    'rowmapper returned a non-sequence value for row %d: '
+                    '%r' % (row_number, outrow))
+                error._petl_no_retry = True
+                raise error
+        except BaseException as error:
+            _handle_error(state, index, row_number, record, attempt, error)
+        else:
+            state.results.put(_Success(index, tuple(outrow)))
+
+
+def _handle_error(state, index, row_number, record, attempt, error):
+    # BaseException (KeyboardInterrupt, SystemExit, ...) never retries,
+    # and wrong-length/non-sequence return values fail the row outright
+    if isinstance(error, Exception) \
+            and not getattr(error, '_petl_no_retry', False) \
+            and isinstance(error, state.retry_on) \
+            and attempt < len(state.retry_delays) \
+            and not state.closing.is_set():
+        delay = state.retry_delays[attempt]
+        _schedule_retry(state, delay,
+                        (index, row_number, record, attempt + 1))
+    else:
+        state.results.put(_Failure(index, error))
+
+
+def _schedule_retry(state, delay, job):
+    due = time.monotonic() + delay
+    with state.timer_cond:
+        state.retry_seq += 1
+        heapq.heappush(state.retry_heap, (due, state.retry_seq, job))
+        state.timer_cond.notify_all()
+
+
+def _retry_timer(state_ref):
+    """Timer thread entry point, holding only a weak reference. Retry delays
+    are waited here rather than inside a worker thread."""
+    while True:
+        state = state_ref()
+        if state is None:
+            return
+        if state.closing.is_set():
+            with state.timer_cond:
+                state.retry_heap.clear()
+            return
+        with state.timer_cond:
+            while not state.retry_heap and not state.closing.is_set():
+                state.timer_cond.wait()
+            if state.closing.is_set():
+                state.retry_heap.clear()
+                return
+            due, seq, job = state.retry_heap[0]
+            now = time.monotonic()
+            if now < due:
+                state.timer_cond.wait(due - now)
+                continue
+            heapq.heappop(state.retry_heap)
+        if state.closing.is_set():
+            # cancelled while waiting: do not start the retry
+            return
+        state.job_queue.put(job)

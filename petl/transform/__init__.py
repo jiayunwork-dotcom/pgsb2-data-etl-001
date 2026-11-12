@@ -38,7 +38,8 @@ from petl.transform.regex import capture, split, search, searchcomplement, \
 from petl.transform.reshape import melt, recast, transpose, pivot, flatten, \
     unflatten
 
-from petl.transform.maps import fieldmap, rowmap, rowmapmany, rowgroupmap
+from petl.transform.maps import fieldmap, rowmap, rowmapmany, rowgroupmap, \
+    rowmapconcurrent
 
 from petl.transform.unpacks import unpack, unpackdict
 

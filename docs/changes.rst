@@ -1,6 +1,18 @@
 Changes
 =======
 
+Unreleased
+----------
+
+* Add :func:`petl.transform.maps.rowmapconcurrent`, a thread-based concurrent
+  variant of :func:`petl.transform.maps.rowmap` for row mappers that spend
+  their time waiting on external services. It supports ordered and
+  completion-order output, a bounded pending window, retries with per-attempt
+  delays that do not occupy worker threads, deterministic failure semantics
+  with the original exception object, and guaranteed cleanup (including
+  garbage collection of an abandoned iterator) with no worker threads left
+  behind. The source table is only ever advanced in the caller thread.
+
 Version 1.7.32
 --------------
 
