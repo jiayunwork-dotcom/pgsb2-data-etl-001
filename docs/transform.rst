@@ -179,6 +179,7 @@ Set operations
 .. autofunction:: petl.transform.setops.diff
 .. autofunction:: petl.transform.setops.recordcomplement
 .. autofunction:: petl.transform.setops.recorddiff
+.. autofunction:: petl.transform.setops.keydiff
 .. autofunction:: petl.transform.setops.intersection
 .. autofunction:: petl.transform.setops.hashcomplement
 .. autofunction:: petl.transform.setops.hashintersection

@@ -4,6 +4,13 @@ Changes
 Version 1.7.32
 --------------
 
+* Add ``keydiff()`` to :mod:`petl.transform.setops`, turning two table
+  snapshots into a key-ordered change stream of ``insert``, ``update`` and
+  ``delete`` records. It supports compound keys, reordered headers, ``None``
+  and unhashable values, detects duplicate keys with side and row number,
+  and uses the same ``buffersize``/``tempdir`` external sorting contract as
+  ``sort()``. ``presorted=True`` streams both sides once.
+
 * Use PETL's mixed-type ordering for variable names discovered by
   ``recast()``, allowing tables with mixed-type headers to be melted and
   recast without a comparison error.
