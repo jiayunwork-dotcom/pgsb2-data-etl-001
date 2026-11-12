@@ -35,8 +35,8 @@ from petl.transform.fills import filldown, fillright, fillleft
 from petl.transform.regex import capture, split, search, searchcomplement, \
     sub, splitdown
 
-from petl.transform.reshape import melt, recast, transpose, pivot, flatten, \
-    unflatten
+from petl.transform.reshape import melt, recast, recastby, transpose, pivot, \
+    flatten, unflatten
 
 from petl.transform.maps import fieldmap, rowmap, rowmapmany, rowgroupmap
 

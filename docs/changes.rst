@@ -4,6 +4,11 @@ Changes
 Version 1.7.32
 --------------
 
+* Add ``recastby()`` and ``Table.recastby()`` for recasting molten data into
+  a fixed set of columns, with explicit ``duplicates`` (``error``/``first``/
+  ``last``) and ``unknown`` (``error``/``ignore``) modes, stable original-input
+  ordering, bounded-memory sorting, and a streaming ``presorted`` mode.
+
 * Use PETL's mixed-type ordering for variable names discovered by
   ``recast()``, allowing tables with mixed-type headers to be melted and
   recast without a comparison error.

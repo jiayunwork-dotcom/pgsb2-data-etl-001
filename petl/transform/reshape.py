@@ -3,15 +3,24 @@ from __future__ import absolute_import, print_function, division
 
 import itertools
 import collections
+import heapq
+import logging
 import operator
-from petl.compat import next, text_type
+import os
+from collections import namedtuple
+from tempfile import NamedTemporaryFile
+from petl.compat import next, text_type, string_types, pickle
 
 
+import petl.config as config
 from petl.errors import ArgumentError
 from petl.comparison import Comparable, comparable_itemgetter
 from petl.util.base import Table, rowgetter, values, itervalues, \
     header, data, asindices
 from petl.transform.sorts import sort
+
+
+logger = logging.getLogger(__name__)
 
 
 def melt(table, key=None, variables=None, variablefield='variable',
@@ -458,6 +467,609 @@ def iterrecast(source, key, variablefield, valuefield,
                     val = redu(vals)
                 out_row.append(val)
         yield tuple(out_row)
+
+
+def recastby(table, key, variablefield, valuefield, fields,
+             duplicates='error', unknown='error', presorted=False,
+             buffersize=None, tempdir=None, missing=None):
+    """
+    Recast molten data into a fixed set of fields, with explicitly controlled
+    behaviour for repeated and unknown variables. E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['id', 'variable', 'value'],
+        ...           [1, 'age', 12],
+        ...           [1, 'gender', 'F'],
+        ...           [2, 'age', 17],
+        ...           [2, 'gender', 'M'],
+        ...           [1, 'age', 13]]
+        >>> table2 = list(etl.recastby(table1, 'id', 'variable', 'value',
+        ...                            ['age', 'gender']))
+        Traceback (most recent call last):
+            ...
+        petl.errors.ArgumentError: argument error: duplicate indicator 'age' \
+for key 1 at data row 5 (first seen at data row 1)
+
+        >>> table3 = etl.recastby(table1, 'id', 'variable', 'value',
+        ...                       ['age', 'gender'], duplicates='last')
+        >>> table3
+        +----+-----+--------+
+        | id | age | gender |
+        +====+=====+========+
+        |  1 |   13 | 'F'    |
+        +----+-----+--------+
+        |  2 |   17 | 'M'    |
+        +----+-----+--------+
+
+        >>> # unknown variables are rejected by default ...
+        ... table4 = [['id', 'variable', 'value'],
+        ...           [1, 'age', 12],
+        ...           [1, 'colour', 'blue']]
+        >>> etl.recastby(table4, 'id', 'variable', 'value', ['age']).look()
+        Traceback (most recent call last):
+            ...
+        petl.errors.ArgumentError: argument error: unknown indicator 'colour' \
+for key 1 at data row 2
+
+        >>> # ... but can be ignored
+        ... table5 = etl.recastby(table4, 'id', 'variable', 'value', ['age'],
+        ...                        unknown='ignore')
+        >>> table5
+        +----+-----+
+        | id | age |
+        +====+=====+
+        |  1 |  12 |
+        +----+-----+
+
+        >>> # compound keys and a missing value are supported
+        ... table6 = [['id', 'time', 'variable', 'value'],
+        ...           [1, 11, 'height', 66.4],
+        ...           [1, 11, 'weight', 12.2],
+        ...           [2, 12, 'height', 53.2]]
+        >>> table7 = etl.recastby(table6, ['id', 'time'], 'variable', 'value',
+        ...                        ['height', 'weight'])
+        >>> table7
+        +----+------+--------+--------+
+        | id | time | height | weight |
+        +====+======+========+========+
+        |  1 |   11 |   66.4 |   12.2 |
+        +----+------+--------+--------+
+        |  2 |   12 |   53.2 |   None |
+        +----+------+--------+--------+
+
+    The `key` argument is a field name or a non-empty sequence of field names.
+    `variablefield` and `valuefield` are single field names. All three must
+    exist in the input header and must not overlap. The `fields` argument is
+    a non-empty sequence of unique field names giving the variables to be
+    recast and the order of the output columns. A single field name may also
+    be given. Each name must be a string and must not clash with a key output
+    field name. `fields` may be a one-shot iterator: it is not consumed when
+    the view is created or `iter()` is called, only when the first result
+    row is actually requested. The resulting column order is then reused for
+    later iterations of the same view.
+
+    Exactly one output row is produced for each distinct key, in the order
+    given on the command line, followed by one column per name in `fields`.
+    When the input is not presorted, output keys are ordered using PETL's
+    usual mixed-type comparison semantics (see :class:`petl.comparison.
+    Comparable`), so `None` can be used as a key value. When the input is
+    presorted, keys must already be in ascending order; a key that goes
+    backwards raises :class:`petl.errors.ArgumentError` reporting the original
+    data row number (data rows are numbered from 1).
+
+    When the same key and variable occur more than once, `duplicates` controls
+    the result: `'error'` (the default) raises :class:`petl.errors.ArgumentError`,
+    `'first'` keeps the first value in the original input order, and `'last'`
+    keeps the last value in the original input order. `None` is treated as a
+    real value rather than as an unset marker.
+
+    Variables not named in `fields` are handled according to `unknown`:
+    `'error'` (the default) raises :class:`petl.errors.ArgumentError`, while
+    `'ignore'` skips such rows. A key that only has unknown variables is still
+    emitted as a row, with every output variable column set to `missing`.
+
+    By default the table is sorted by key. `buffersize` limits the number of
+    rows held in memory while sorting and `tempdir` selects the directory used
+    for temporary spill files; with a `buffersize` of `None`, the value of
+    ``petl.config.sort_buffersize`` is used (and `None` there means sort
+    entirely in memory). Rows read from the source retain their original input
+    order after spilling and merging, so `duplicates='first'` and
+    `duplicates='last'` are stable. The sort is performed for each result
+    iteration; results are not cached across iterations. This means a
+    re-readable source yields consistent results, but a one-shot source is
+    not made replayable.
+
+    With `presorted=True`, each input row is consumed exactly once and only
+    one row needs to be held in memory while a group is being assembled. The
+    previous group is emitted as soon as the first row of the next group has
+    been read. With a fixed number of output columns, memory used for a group
+    does not grow with the number of its input rows.
+
+    Iterating the source is lazy: constructing the view and calling `iter()`
+    do not read the source or consume `fields`. Each result iteration requests
+    one iterator from the source. The source iterator is closed, and any
+    temporary sort files are removed, when the result is exhausted, when an
+    exception occurs, or when the result iterator is explicitly closed.
+    Cleanup never replaces an exception raised by the source. Do not change
+    source fields while result iterators are active. Rows are copied as
+    shallow tuples, as with :func:`petl.transform.reshape.recast`; mutable
+    objects stored in cells are not copied.
+
+    This function complements :func:`petl.transform.reshape.recast`, whose
+    signature, sampling and `reducers` behaviour are unchanged.
+
+    Performance and compatibility trade-offs:
+
+    * With `presorted=True` the transform is streaming: it needs O(len(key) +
+      len(fields)) extra memory per group aside from the one next row held to
+      detect the group boundary, and it avoids all sorting and spilling. This
+      is the recommended mode for large inputs already ordered by key. It
+      trusts the caller's ordering, so it additionally checks for a key that
+      goes backwards and reports it with the original data row number. A
+      duplicated or unknown indicator is still reported with its original
+      data row number, but only while its own group is held; the group is
+      emitted before any later group is read.
+
+    * Without `presorted`, every data row is read and (unless it fits in the
+      sort buffer) spilled to disk before any result row after the header can
+      be produced. The whole input is traversed once, so duplicates and
+      unknown indicators anywhere in the table are diagnosed with their
+      original row numbers, and a backwards key is not an error because the
+      transform sorts. Memory is bounded by `buffersize` (plus one group's
+      state during the merge). The cost is latency, not extra source passes:
+      the source is read exactly once per result iteration, but the first
+      data row is delayed until the input has been sorted.
+
+    * Unlike :func:`petl.transform.reshape.recast`, this transform does not
+      guess fields, does not sample, and never caches its result. Callers that
+      need repeated, cheap passes should materialise the result (for example
+      with :func:`petl.util.materialise.cache`) rather than rely on this view.
+
+    * The result emits exactly the key columns in `key` order plus exactly
+      `fields`, so its header is fixed up front rather than discovered from a
+      sample. This is why an empty input (header only) still emits a
+      complete output header, while a completely empty input (no header) is
+      rejected.
+
+    """
+
+    return RecastByView(table, key, variablefield, valuefield, fields,
+                        duplicates=duplicates, unknown=unknown,
+                        presorted=presorted, buffersize=buffersize,
+                        tempdir=tempdir, missing=missing)
+
+
+Table.recastby = recastby
+
+
+class RecastByView(Table):
+
+    def __init__(self, source, key, variablefield, valuefield, fields,
+                 duplicates='error', unknown='error', presorted=False,
+                 buffersize=None, tempdir=None, missing=None):
+        # Reject invalid modes immediately: these do not depend on the
+        # (possibly one-shot) `fields` argument or on the input header.
+        _recastby_validate_modes(duplicates, unknown)
+        if buffersize is not None:
+            _recastby_check_buffersize(buffersize)
+        self.source = source
+        self.key = key
+        self.variablefield = variablefield
+        self.valuefield = valuefield
+        self.fields = fields
+        # N.B., `duplicates` is also a fluent Table method; storing it as an
+        # instance attribute would shadow the method.
+        self._duplicates = duplicates
+        self.unknown = unknown
+        self.presorted = presorted
+        self.buffersize = buffersize
+        self.tempdir = tempdir
+        self.missing = missing
+        # `fields` may be a one-shot iterator, so only resolve it on the
+        # first actual iteration, and reuse the resolved order afterwards.
+        self._fields_ready = False
+        self._fields = None
+        self._fields_error = None
+
+    def __iter__(self):
+        return iterrecastby(self.source, self.key, self.variablefield,
+                            self.valuefield, self.fields, self._duplicates,
+                            self.unknown, self.presorted, self.buffersize,
+                            self.tempdir, self.missing, self)
+
+    def _resolve_fields(self, keyfields):
+        if not self._fields_ready:
+            try:
+                self._fields = _prepare_recastby_fields(self.fields, keyfields)
+            except Exception as e:
+                self._fields_error = e
+            self._fields_ready = True
+        if self._fields_error is not None:
+            raise self._fields_error
+        return self._fields
+
+
+_RECASTBY_UNSET = object()
+_RECASTBY_DUPLICATES = ('error', 'first', 'last')
+_RECASTBY_UNKNOWN = ('error', 'ignore')
+
+
+def _recastby_validate_modes(duplicates, unknown):
+    if duplicates not in _RECASTBY_DUPLICATES:
+        raise ArgumentError(
+            "invalid duplicates mode: %r (expected 'error', 'first' or "
+            "'last')" % (duplicates,))
+    if unknown not in _RECASTBY_UNKNOWN:
+        raise ArgumentError(
+            "invalid unknown mode: %r (expected 'error' or 'ignore')"
+            % (unknown,))
+
+
+def _recastby_check_buffersize(buffersize):
+    if not isinstance(buffersize, int) or isinstance(buffersize, bool) \
+            or buffersize < 1:
+        raise ArgumentError(
+            'buffersize must be a positive integer or None, got %r'
+            % (buffersize,))
+
+
+def _recastby_buffersize(buffersize):
+    if buffersize is None:
+        buffersize = config.sort_buffersize
+    if buffersize is None:
+        return None
+    _recastby_check_buffersize(buffersize)
+    return buffersize
+
+
+def _recastby_header_fields(hdr):
+    flds = list(map(text_type, hdr))
+    for i, f in enumerate(flds):
+        if f in flds[:i]:
+            raise ArgumentError('duplicate header field: %r' % (f,))
+    return flds
+
+
+def _recastby_keyfields(key):
+    if isinstance(key, string_types):
+        keyfields = (key,)
+    else:
+        try:
+            keyfields = tuple(key)
+        except TypeError:
+            raise ArgumentError(
+                'key must be a field name or a sequence of field names')
+    if not keyfields:
+        raise ArgumentError('key must contain at least one field name')
+    for i, f in enumerate(keyfields):
+        if not isinstance(f, string_types):
+            raise ArgumentError('invalid key field: %r' % (f,))
+        if f in keyfields[:i]:
+            raise ArgumentError('duplicate key field: %r' % (f,))
+    return keyfields
+
+
+def _recastby_single_field(name, label):
+    if not isinstance(name, string_types):
+        raise ArgumentError('%s must be a single field name: %r'
+                            % (label, name))
+    return name
+
+
+def _recastby_index(flds, name, label):
+    try:
+        return flds.index(name)
+    except ValueError:
+        raise ArgumentError('invalid %s: %s' % (label, name))
+
+
+def _prepare_recastby_fields(fields, keyfields):
+    if isinstance(fields, string_types):
+        names = (fields,)
+    else:
+        if fields is None:
+            raise ArgumentError('fields must be a sequence of field names')
+        try:
+            names = tuple(fields)
+        except TypeError:
+            raise ArgumentError(
+                'fields must be a sequence of field names')
+    if not names:
+        raise ArgumentError('fields must contain at least one field name')
+    for f in names:
+        if not isinstance(f, string_types):
+            raise ArgumentError(
+                'fields must be field names (strings): %r' % (f,))
+    seen = set()
+    for f in names:
+        if f in seen:
+            raise ArgumentError('duplicate field in fields: %r' % (f,))
+        seen.add(f)
+    for f in names:
+        if f in keyfields:
+            raise ArgumentError(
+                'field %r conflicts with a key field' % (f,))
+    return names
+
+
+def _recastby_display_key(keytuple):
+    if len(keytuple) == 1:
+        return keytuple[0]
+    return keytuple
+
+
+def _recastby_check_width(row, rownum, width):
+    if len(row) != width:
+        raise ArgumentError(
+            'data row %d has %d values but the header has %d fields'
+            % (rownum, len(row), width))
+
+
+def _recastby_sortkey(record):
+    # record is (keytuple, original row number, row); the row number makes
+    # the order of equal keys independent of chunk spilling and merging.
+    return (Comparable(record[0]), record[1])
+
+
+class _RecastByKeyed(namedtuple('_RecastByKeyed', ['key', 'obj'])):
+
+    def __eq__(self, other):
+        return self.key == other.key
+
+    def __lt__(self, other):
+        return self.key < other.key
+
+    def __le__(self, other):
+        return self.key <= other.key
+
+    def __ne__(self, other):
+        return self.key != other.key
+
+    def __gt__(self, other):
+        return self.key > other.key
+
+    def __ge__(self, other):
+        return self.key >= other.key
+
+
+def _safe_close(obj, what='iterator'):
+    close = getattr(obj, 'close', None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:
+        logger.debug('exception closing %s', what, exc_info=True)
+
+
+def _iter_presorted_records(it, width, keyindices):
+    rownum = 0
+    for row in it:
+        rownum += 1
+        row = tuple(row)
+        _recastby_check_width(row, rownum, width)
+        yield (tuple(row[i] for i in keyindices), rownum, row)
+
+
+def _read_recastby_chunk(it, width, keyindices, buffersize, start):
+    records = []
+    rownum = start
+    for row in itertools.islice(it, 0, buffersize):
+        rownum += 1
+        row = tuple(row)
+        _recastby_check_width(row, rownum, width)
+        records.append((tuple(row[i] for i in keyindices), rownum, row))
+    return records, rownum
+
+
+def _dump_recastby_chunk(records, tempdir, filenames):
+    f = NamedTemporaryFile(dir=tempdir, delete=False, mode='wb')
+    # record the name before writing so a failed write is still cleaned up
+    filenames.append(f.name)
+    try:
+        for record in records:
+            pickle.dump(record, f, protocol=-1)
+        f.flush()
+    finally:
+        f.close()
+
+
+def _iter_recastby_chunk_file(fn):
+    with open(fn, 'rb') as f:
+        while True:
+            try:
+                yield pickle.load(f)
+            except EOFError:
+                return
+
+
+def _keyed_recastby_iter(it):
+    for record in it:
+        yield _RecastByKeyed(_recastby_sortkey(record), record)
+
+
+def _merge_recastby_chunk_files(filenames):
+    chunkiters = []
+    keyediters = []
+    try:
+        chunkiters = [_iter_recastby_chunk_file(fn) for fn in filenames]
+        keyediters = [_keyed_recastby_iter(it) for it in chunkiters]
+        for item in heapq.merge(*keyediters):
+            yield item.obj
+    finally:
+        for it in keyediters:
+            _safe_close(it, 'sort chunk')
+        for it in chunkiters:
+            _safe_close(it, 'sort chunk file')
+
+
+def _unlink_recastby_files(filenames):
+    for fn in filenames:
+        try:
+            os.unlink(fn)
+        except Exception:
+            # Cleanup must never replace an exception from the source or
+            # from the caller's iteration.
+            logger.debug('exception deleting %s', fn, exc_info=True)
+
+
+def _iter_sorted_recastby_records(it, width, keyindices, buffersize,
+                                  tempdir):
+    filenames = []
+    try:
+        chunk, rownum = _read_recastby_chunk(
+            it, width, keyindices, buffersize, 0)
+        if not chunk:
+            return
+        chunk.sort(key=_recastby_sortkey)
+        if buffersize is None or len(chunk) < buffersize:
+            for record in chunk:
+                yield record
+            return
+
+        # The first chunk filled the buffer, so there may be more data.
+        while chunk:
+            _dump_recastby_chunk(chunk, tempdir, filenames)
+            chunk, rownum = _read_recastby_chunk(
+                it, width, keyindices, buffersize, rownum)
+            if chunk:
+                chunk.sort(key=_recastby_sortkey)
+
+        mergeiter = _merge_recastby_chunk_files(filenames)
+        try:
+            for record in mergeiter:
+                yield record
+        finally:
+            _safe_close(mergeiter, 'sort merge')
+    finally:
+        _unlink_recastby_files(filenames)
+
+
+def _recastby_field_index(indicator, field_index, fields):
+    try:
+        return field_index.get(indicator)
+    except TypeError:
+        # an unknown variable may itself be unhashable, e.g. a list or dict
+        for i, f in enumerate(fields):
+            if f == indicator:
+                return i
+        return None
+
+
+def _recastby_output(keytuple, values, missing):
+    out = list(keytuple)
+    for value in values:
+        out.append(missing if value is _RECASTBY_UNSET else value)
+    return tuple(out)
+
+
+def _iter_recastby_groups(records, variableindex, valueindex, fields,
+                          duplicates, unknown, missing, check_order):
+    unset = _RECASTBY_UNSET
+    nfields = len(fields)
+    field_index = {f: i for i, f in enumerate(fields)}
+    prev_key = unset
+    prev_comparable = None
+    values = None
+    seen_rows = None
+    for keytuple, rownum, row in records:
+        if prev_key is unset:
+            prev_key = keytuple
+            prev_comparable = Comparable(keytuple)
+            values = [unset] * nfields
+            seen_rows = [-1] * nfields
+        elif keytuple != prev_key:
+            if check_order:
+                current_comparable = Comparable(keytuple)
+                if current_comparable < prev_comparable:
+                    raise ArgumentError(
+                        'key out of order at data row %d: %r follows %r'
+                        % (rownum, _recastby_display_key(keytuple),
+                           _recastby_display_key(prev_key)))
+            yield _recastby_output(prev_key, values, missing)
+            prev_key = keytuple
+            prev_comparable = Comparable(keytuple)
+            values = [unset] * nfields
+            seen_rows = [-1] * nfields
+
+        indicator = row[variableindex]
+        idx = _recastby_field_index(indicator, field_index, fields)
+        if idx is None:
+            if unknown == 'ignore':
+                continue
+            raise ArgumentError(
+                'unknown indicator %r for key %r at data row %d'
+                % (indicator, _recastby_display_key(keytuple), rownum))
+
+        if seen_rows[idx] >= 0:
+            if duplicates == 'error':
+                raise ArgumentError(
+                    'duplicate indicator %r for key %r at data row %d '
+                    '(first seen at data row %d)'
+                    % (indicator, _recastby_display_key(keytuple), rownum,
+                       seen_rows[idx]))
+            elif duplicates == 'last':
+                values[idx] = row[valueindex]
+            # duplicates == 'first': keep the existing value, including None
+        else:
+            seen_rows[idx] = rownum
+            values[idx] = row[valueindex]
+
+    if prev_key is not unset:
+        yield _recastby_output(prev_key, values, missing)
+
+
+def iterrecastby(source, key, variablefield, valuefield, fields, duplicates,
+                 unknown, presorted, buffersize, tempdir, missing, view):
+    _recastby_validate_modes(duplicates, unknown)
+    if not presorted:
+        buffersize = _recastby_buffersize(buffersize)
+
+    it = iter(source)  # exactly one source iterator per result iteration
+    records = None
+    try:
+        try:
+            hdr = next(it)
+        except StopIteration:
+            raise ArgumentError('no header row')
+        hdr = tuple(hdr)
+        width = len(hdr)
+        flds = _recastby_header_fields(hdr)
+
+        keyfields = _recastby_keyfields(key)
+        keyindices = [_recastby_index(flds, f, 'key field')
+                      for f in keyfields]
+        variablefield = _recastby_single_field(variablefield, 'variablefield')
+        valuefield = _recastby_single_field(valuefield, 'valuefield')
+        variableindex = _recastby_index(flds, variablefield,
+                                        'variable field')
+        valueindex = _recastby_index(flds, valuefield, 'value field')
+
+        if variableindex in keyindices:
+            raise ArgumentError('variable field cannot be a key field')
+        if valueindex in keyindices:
+            raise ArgumentError('value field cannot be a key field')
+        if variableindex == valueindex:
+            raise ArgumentError(
+                'variable field and value field must be different')
+
+        fields = view._resolve_fields(keyfields)
+        outhdr = tuple(keyfields) + tuple(fields)
+        yield outhdr
+
+        if presorted:
+            records = _iter_presorted_records(it, width, keyindices)
+        else:
+            records = _iter_sorted_recastby_records(
+                it, width, keyindices, buffersize, tempdir)
+        for outrow in _iter_recastby_groups(
+                records, variableindex, valueindex, fields, duplicates,
+                unknown, missing, presorted):
+            yield outrow
+    finally:
+        if records is not None:
+            _safe_close(records, 'record iterator')
+        _safe_close(it, 'source iterator')
 
 
 def transpose(table):

@@ -223,6 +223,7 @@ Reshaping tables
 
 .. autofunction:: petl.transform.reshape.melt
 .. autofunction:: petl.transform.reshape.recast
+.. autofunction:: petl.transform.reshape.recastby
 .. autofunction:: petl.transform.reshape.transpose
 .. autofunction:: petl.transform.reshape.pivot
 .. autofunction:: petl.transform.reshape.flatten
