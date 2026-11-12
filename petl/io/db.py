@@ -5,6 +5,7 @@ from __future__ import absolute_import, print_function, division
 # standard library dependencies
 import itertools
 import logging
+import sqlite3
 import threading
 from petl.compat import next, text_type, string_types
 
@@ -385,6 +386,23 @@ def todb(table, dbo, tablename, schema=None, commit=True,
     source is still consumed lazily in a single pass, so the full batch is
     never materialised in memory.
 
+    Failures that SQLite only reports when the transaction is finalised are
+    handled as well. In particular, a foreign key declared
+    ``DEFERRABLE INITIALLY DEFERRED`` with ``PRAGMA foreign_keys=ON`` is not
+    checked while rows are written: the violation only appears at
+    ``COMMIT`` (or when the outermost ``SAVEPOINT`` is released), and another
+    connection holding a read lock can make the same ``COMMIT`` report
+    "database is locked". In these cases the load is still rolled back in
+    full: the target table returns to its pre-load contents, the original
+    :class:`sqlite3.IntegrityError` or :class:`sqlite3.OperationalError`
+    reaches the caller unchanged, and a connection that had no transaction on
+    entry is left without an active transaction rather than holding a
+    half-finished batch. When the load runs inside a caller-owned
+    transaction, deferred foreign key violations introduced by this load are
+    detected before the savepoint is released so that only the load is
+    undone; violations that already existed before the load are tolerated,
+    matching SQLite's own commit behaviour.
+
     Transaction ownership follows the state of the connection on entry:
 
     * If the connection already has an open transaction (including
@@ -639,11 +657,20 @@ def _todb_sqlite3_atomic(table, dbo, tablename, schema=None, commit=True,
             debug('atomic load inside existing transaction, savepoint %r',
                   savepoint)
             tx_cursor.execute('SAVEPOINT %s' % savepoint)
+            # a deferred foreign key violation only surfaces when the
+            # outermost savepoint is released, and by then SQLite has popped
+            # the savepoint, so the load can no longer be undone on its own.
+            # Snapshot the violations already present so that, before the
+            # RELEASE, we only react to violations introduced by this load
+            # (native COMMIT likewise tolerates violations that predate the
+            # transaction).
+            fk_snapshot = _sqlite3_foreign_key_violations(tx_cursor)
         else:
             # open a transaction ourselves; works both with the default
             # isolation handling and with isolation_level=None
             debug('atomic load opens a new transaction')
             tx_cursor.execute('BEGIN')
+            fk_snapshot = None
 
         try:
             if truncate:
@@ -662,17 +689,45 @@ def _todb_sqlite3_atomic(table, dbo, tablename, schema=None, commit=True,
             # a rollback failure must not mask the original load error
             _sqlite3_undo_load(tx_cursor, savepoint)
             raise
-        else:
-            if savepoint is not None:
-                # leave the caller's transaction open for its own
-                # commit/rollback; commit is intentionally ignored here
-                debug('release savepoint %r after successful atomic load',
-                      savepoint)
+
+        if savepoint is not None:
+            # detect deferred FK failures before the RELEASE pops the
+            # outermost savepoint, so this load can still be rolled back on
+            # its own without touching the caller's outer transaction
+            new_violations = _sqlite3_new_foreign_key_violations(
+                tx_cursor, fk_snapshot)
+            if new_violations:
+                debug('atomic load introduced deferred foreign key '
+                      'violations: %r', new_violations)
+                _sqlite3_undo_load(tx_cursor, savepoint)
+                raise sqlite3.IntegrityError('FOREIGN KEY constraint failed')
+            # leave the caller's transaction open for its own
+            # commit/rollback; commit is intentionally ignored here
+            debug('release savepoint %r after successful atomic load',
+                  savepoint)
+            try:
                 tx_cursor.execute('RELEASE %s' % savepoint)
-            elif commit:
-                debug('commit transaction after successful atomic load')
+            except BaseException:
+                # defensive: if the RELEASE itself fails after the checks
+                # above, undo the load where a boundary still exists; the
+                # original RELEASE exception is never replaced
+                _sqlite3_undo_load(tx_cursor, savepoint, raise_on_error=False)
+                raise
+        elif commit:
+            debug('commit transaction after successful atomic load')
+            try:
                 tx_cursor.execute('COMMIT')
-            # else: leave the transaction we opened uncommitted for the caller
+            except BaseException:
+                # a COMMIT can fail after every row was written, e.g. a
+                # deferred constraint check or "database is locked"; the
+                # transaction is still open at this point, so roll it back
+                # to restore the pre-load contents and return the
+                # connection to its entry state (no active transaction)
+                debug('commit of atomic load failed, rolling back',
+                      exc_info=True)
+                _sqlite3_undo_load(tx_cursor, None)
+                raise
+        # else: leave the transaction we opened uncommitted for the caller
         load_failed = False
     finally:
         # always release the transaction cursor we created; a borrowed data
@@ -690,7 +745,7 @@ def _todb_sqlite3_atomic(table, dbo, tablename, schema=None, commit=True,
             _close_load_cursor(cursor, load_failed)
 
 
-def _sqlite3_undo_load(tx_cursor, savepoint):
+def _sqlite3_undo_load(tx_cursor, savepoint, raise_on_error=False):
     try:
         if savepoint is not None:
             debug('roll back savepoint %r after failed atomic load',
@@ -701,7 +756,31 @@ def _sqlite3_undo_load(tx_cursor, savepoint):
             debug('roll back transaction after failed atomic load')
             tx_cursor.execute('ROLLBACK')
     except BaseException:
+        if raise_on_error:
+            raise
         debug('could not roll back failed atomic load', exc_info=True)
+
+
+def _sqlite3_foreign_key_enforced(tx_cursor):
+    # PRAGMA foreign_keys is per-connection; only a 1 means deferred foreign
+    # key enforcement can make a COMMIT or the outermost SAVEPOINT release
+    # fail at transaction finalisation time
+    row = tx_cursor.execute('PRAGMA foreign_keys').fetchone()
+    return bool(row and row[0])
+
+
+def _sqlite3_foreign_key_violations(tx_cursor):
+    if not _sqlite3_foreign_key_enforced(tx_cursor):
+        return frozenset()
+    # PRAGMA foreign_key_check scans every attached database and works
+    # inside an open transaction, seeing this connection's uncommitted writes
+    return frozenset(tx_cursor.execute('PRAGMA foreign_key_check'))
+
+
+def _sqlite3_new_foreign_key_violations(tx_cursor, earlier_violations):
+    if earlier_violations is None:
+        return frozenset()
+    return _sqlite3_foreign_key_violations(tx_cursor) - earlier_violations
 
 
 def _sqlite3_in_transaction(connection):

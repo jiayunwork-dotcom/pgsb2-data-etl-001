@@ -13,6 +13,19 @@ Version 1.7.32
   factories and database file paths are supported; the default behaviour is
   unchanged when ``atomic`` is omitted or False.
 
+* Roll back an atomic ``sqlite3`` load when the failure only surfaces while
+  the transaction is being finalised, instead of leaving a half-written
+  table. A deferred foreign key (``DEFERRABLE INITIALLY DEFERRED`` with
+  ``PRAGMA foreign_keys=ON``) previously failed at ``COMMIT``, or at the
+  release of the outermost SAVEPOINT inside a caller transaction, after the
+  truncate and inserts had already run; a competing read lock could likewise
+  make the ``COMMIT`` report "database is locked". Such loads now undo all of
+  their writes and restore the pre-load table contents while propagating the
+  original ``sqlite3`` exception unchanged. Connections without an outer
+  transaction return to having no active transaction, caller-owned
+  transactions and SAVEPOINTs keep their earlier writes, and the connection
+  remains usable for the next atomic load.
+
 * Use PETL's mixed-type ordering for variable names discovered by
   ``recast()``, allowing tables with mixed-type headers to be melted and
   recast without a comparison error.
