@@ -1,6 +1,19 @@
 Changes
 =======
 
+Version 1.7.33
+--------------
+
+* Add :func:`petl.asofjoin` (also available as ``Table.asofjoin``), a lazy
+  as-of join for correlating events with historical observations. Each left
+  row is matched with at most one right row from the same business group,
+  with ``backward`` (default), ``forward`` and ``nearest`` time directions,
+  an optional inclusive ``tolerance``, and an ``allow_exact_matches``
+  switch. Inputs are streamed through a single iterator per table; when the
+  inputs are not already ordered the existing stable, external-merge
+  :func:`petl.transform.sort.sort` is reused so large tables never have to
+  fit in memory.
+
 Version 1.7.32
 --------------
 

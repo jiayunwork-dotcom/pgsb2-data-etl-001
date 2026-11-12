@@ -169,6 +169,15 @@ Joins
 .. autofunction:: petl.transform.hashjoins.hashantijoin
 
 
+.. module:: petl.transform.asof
+.. _transform_asof:
+
+As-of joins
+-----------
+
+.. autofunction:: petl.transform.asof.asofjoin
+
+
 .. module:: petl.transform.setops
 .. _transform_setops:
 
