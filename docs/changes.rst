@@ -1,6 +1,19 @@
 Changes
 =======
 
+Unreleased
+----------
+
+* Added :func:`petl.transform.groupingsets.groupstate` and
+  :func:`petl.transform.groupingsets.groupingsets` for aggregating a table
+  over several grouping sets in a single pass, together with the
+  :class:`petl.transform.groupingsets.GroupState` class, whose mergeable and
+  serializable partial aggregation states allow, e.g., daily aggregates to be
+  combined into monthly ones without re-reading the detail rows. Also added
+  :func:`petl.transform.groupingsets.loadgroupstate` to restore a serialized
+  state, and the ``Table.groupstate`` and ``Table.groupingsets`` convenience
+  methods.
+
 Version 1.7.32
 --------------
 

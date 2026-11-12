@@ -215,6 +215,19 @@ Reducing rows (aggregation)
 .. autofunction:: petl.transform.reductions.groupselectmax
 
 
+.. module:: petl.transform.groupingsets
+.. _transform_groupingsets:
+
+Grouping sets (mergeable aggregation)
+-------------------------------------
+
+.. autofunction:: petl.transform.groupingsets.groupstate
+.. autofunction:: petl.transform.groupingsets.groupingsets
+.. autofunction:: petl.transform.groupingsets.loadgroupstate
+.. autoclass:: petl.transform.groupingsets.GroupState
+   :members: merge, totable, dumps, key, sets, measures, batches
+
+
 .. module:: petl.transform.reshape
 .. _transform_reshape:
 
