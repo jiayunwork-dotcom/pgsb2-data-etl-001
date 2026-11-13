@@ -11,6 +11,9 @@ from petl.transform.conversions import convert, convertall, replace, \
     replaceall, update, convertnumbers, format, formatall, interpolate, \
     interpolateall
 
+from petl.transform.convertcapture import convertcapture, ConvertCapture, \
+    BAD_HEADER
+
 from petl.transform.sorts import sort, mergesort, issorted
 
 from petl.transform.selects import select, selectop, selectcontains, \

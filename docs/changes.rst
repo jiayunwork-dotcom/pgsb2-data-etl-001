@@ -1,6 +1,17 @@
 Changes
 =======
 
+Next version
+------------
+
+* Added :func:`petl.convertcapture`, a single-pass conversion that reads the
+  input table at most once and routes fully converted rows to a ``good``
+  branch and failed or wrong-width rows to a fixed-schema ``bad`` branch.
+  Each branch is a single-consumption table; backlogs beyond ``buffersize``
+  spill to temporary pickle files under ``tempdir`` and are reclaimed as
+  they are delivered. The returned capture object is a context manager with
+  an idempotent ``close()``, and branches can be abandoned independently.
+
 Version 1.7.32
 --------------
 

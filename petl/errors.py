@@ -26,3 +26,16 @@ class ArgumentError(Exception):
 
     def __str__(self):
         return 'argument error: %s' % self.message
+
+
+class RowLengthError(Exception):
+    """Raised (and reported by :func:`petl.transform.convertcapture`) when a
+    data row does not have the same number of columns as the table header."""
+
+    def __init__(self, expected, actual):
+        self.expected = expected
+        self.actual = actual
+
+    def __str__(self):
+        return ('row length error: expected %d columns, found %d'
+                % (self.expected, self.actual))
