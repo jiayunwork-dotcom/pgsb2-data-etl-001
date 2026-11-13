@@ -1,6 +1,20 @@
 Changes
 =======
 
+Unreleased
+----------
+
+* Add :func:`petl.io.csvcheckpoint.fromcsvcheckpoint`, a Python 3-only,
+  resumable CSV reader.  Each iteration is an independent cursor that can
+  publish a JSON-serialisable checkpoint after the header and after every
+  fully delivered data record.  Checkpoints bind the file's complete SHA-256
+  content, the parse configuration, the header and the delivered byte
+  position, so an identical copy of the file can resume elsewhere while a
+  modified, truncated or appended file is rejected.  Restore validates the
+  whole file with one bounded-memory scan (O(file size)) and then decodes
+  from the saved record boundary instead of replaying the prefix through the
+  CSV parser.
+
 Version 1.7.32
 --------------
 

@@ -100,6 +100,37 @@ Delimited files
 .. autofunction:: petl.io.csv.appendtsv
 .. autofunction:: petl.io.csv.teetsv
 
+Resumable reading
+^^^^^^^^^^^^^^^^^
+
+.. autofunction:: petl.io.csvcheckpoint.fromcsvcheckpoint
+
+Every iteration of a :func:`~petl.io.csvcheckpoint.fromcsvcheckpoint` table is
+an independent cursor.  Cursors expose ``next()``, ``close()`` and
+``checkpoint()``; ``checkpoint()`` returns a plain, JSON-serialisable
+dictionary that can be stored by the caller and passed back to a later call::
+
+    >>> import json
+    >>> import petl as etl  # doctest: +SKIP
+    >>> cursor = iter(etl.fromcsvcheckpoint('events.csv'))
+    >>> next(cursor)                          # header
+    >>> row = next(cursor)                    # first fully delivered row
+    >>> progress = json.dumps(cursor.checkpoint())
+    >>> cursor.close()
+    >>> saved = json.loads(progress)
+    >>> cursor = iter(etl.fromcsvcheckpoint('events.csv',
+    ...                                     checkpoint=saved))
+    >>> next(cursor)                          # the same header
+    >>> next(cursor)                          # the row after `progress`
+
+The checkpoint binds the file's full SHA-256 content, the parse configuration,
+the header and the committed data position, but not the path, so an identical
+copy elsewhere can resume while a modified, truncated or appended file is
+rejected.  Resuming is not constant time: the library performs one
+bounded-memory scan of the whole file to validate the digest (O(file size))
+and then parses only the header before decoding from the saved record
+boundary.  The prefix's CSV records are never replayed through the parser.
+
 
 .. module:: petl.io.pickle
 .. _io_pickle:

@@ -9,6 +9,13 @@ from petl.io.sources import FileSource, GzipSource, BZ2Source, ZipSource, \
 from petl.io.csv import fromcsv, fromtsv, tocsv, appendcsv, totsv, appendtsv, \
     teecsv, teetsv
 
+from petl.compat import PY3
+if PY3:
+    # The checkpointed reader is a Python 3-only addition; importing it on
+    # Python 2 would fail, so guard the public export rather than the rest of
+    # the I/O API.
+    from petl.io.csvcheckpoint import fromcsvcheckpoint
+
 from petl.io.pickle import frompickle, topickle, appendpickle, teepickle
 
 from petl.io.text import fromtext, totext, appendtext, teetext
