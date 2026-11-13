@@ -620,6 +620,17 @@ for key 1 at data row 2
       the source is read exactly once per result iteration, but the first
       data row is delayed until the input has been sorted.
 
+    * Spilled chunks are merged in several passes with a bounded fan-in
+      (approximately `buffersize`, capped at a small constant). A merge
+      therefore keeps only a fixed number of run files open and a fixed
+      number of buffered records, no matter how many chunks the input
+      produced. Each run file is opened lazily and closed and unlinked as
+      soon as it has been consumed; intermediate merge runs are removed in
+      the same way, so the temporary directory does not accumulate per-pass
+      copies of the data. The total number of temporary files may grow with
+      the input size, but the number open at any time and the number of
+      retained rows do not.
+
     * Unlike :func:`petl.transform.reshape.recast`, this transform does not
       guess fields, does not sample, and never caches its result. Callers that
       need repeated, cheap passes should materialise the result (for example
@@ -692,6 +703,21 @@ class RecastByView(Table):
 _RECASTBY_UNSET = object()
 _RECASTBY_DUPLICATES = ('error', 'first', 'last')
 _RECASTBY_UNKNOWN = ('error', 'ignore')
+# Upper bound on the number of sorted runs merged in one pass. This bounds
+# the number of temporary run files open at the same time and the number of
+# records buffered while merging, independently of how many chunks the input
+# spills to. The effective fan-in is further limited by the sort buffer size
+# (see _recastby_merge_fanin), so the merge never retains more records than
+# the in-memory sort does by more than a constant factor.
+_RECASTBY_MERGE_FANIN = 32
+
+
+def _recastby_merge_fanin(buffersize):
+    # At least two runs are needed to make progress; otherwise keep the
+    # fan-in proportional to the sort buffer, capped at the constant above.
+    if buffersize is None:
+        return _RECASTBY_MERGE_FANIN
+    return max(2, min(_RECASTBY_MERGE_FANIN, buffersize))
 
 
 def _recastby_validate_modes(duplicates, unknown):
@@ -862,25 +888,54 @@ def _read_recastby_chunk(it, width, keyindices, buffersize, start):
     return records, rownum
 
 
-def _dump_recastby_chunk(records, tempdir, filenames):
+def _pickle_dump_recastby_record(record, f):
+    # Separate indirection so tests can inject controlled write failures.
+    pickle.dump(record, f, protocol=-1)
+
+
+def _dump_recastby_chunk(records, tempdir, live):
     f = NamedTemporaryFile(dir=tempdir, delete=False, mode='wb')
     # record the name before writing so a failed write is still cleaned up
-    filenames.append(f.name)
+    live.add(f.name)
     try:
         for record in records:
-            pickle.dump(record, f, protocol=-1)
+            _pickle_dump_recastby_record(record, f)
         f.flush()
     finally:
-        f.close()
+        _safe_close(f, 'sort chunk')
+
+
+def _open_recastby_chunk_file(fn):
+    # Separate indirection so tests can inject controlled read failures;
+    # also the single place a run file is opened.
+    return open(fn, 'rb')
 
 
 def _iter_recastby_chunk_file(fn):
-    with open(fn, 'rb') as f:
+    f = _open_recastby_chunk_file(fn)
+    try:
         while True:
             try:
                 yield pickle.load(f)
             except EOFError:
                 return
+    finally:
+        _safe_close(f, 'sort chunk file')
+
+
+def _iter_recastby_run_file(fn, live):
+    # the run file is opened lazily, when this iterator is first advanced,
+    # and removed as soon as the run has been (or stops being) consumed.
+    # Once it is gone, its name is dropped from `live`, so the cleanup
+    # registry only holds files that still exist.
+    it = _iter_recastby_chunk_file(fn)
+    try:
+        for record in it:
+            yield record
+    finally:
+        _safe_close(it, 'sort chunk file')
+        if _unlink_recastby_file(fn):
+            live.discard(fn)
 
 
 def _keyed_recastby_iter(it):
@@ -888,34 +943,93 @@ def _keyed_recastby_iter(it):
         yield _RecastByKeyed(_recastby_sortkey(record), record)
 
 
-def _merge_recastby_chunk_files(filenames):
-    chunkiters = []
+def _merge_recastby_chunk_files(filenames, live):
+    """Merge at most ``_RECASTBY_MERGE_FANIN`` sorted run files.
+
+    Every run file is opened lazily and closed and unlinked once it is
+    exhausted, so a merge never keeps more than the fan-in number of
+    temporary files (and one buffered record per file) alive. Callers bound
+    the number of runs passed to a single call, independently of the total
+    number of spilled chunks.
+    """
+    runiters = []
     keyediters = []
     try:
-        chunkiters = [_iter_recastby_chunk_file(fn) for fn in filenames]
-        keyediters = [_keyed_recastby_iter(it) for it in chunkiters]
+        runiters = [_iter_recastby_run_file(fn, live) for fn in filenames]
+        keyediters = [_keyed_recastby_iter(it) for it in runiters]
         for item in heapq.merge(*keyediters):
             yield item.obj
     finally:
         for it in keyediters:
             _safe_close(it, 'sort chunk')
-        for it in chunkiters:
+        for it in runiters:
             _safe_close(it, 'sort chunk file')
+
+
+def _dump_recastby_merged_chunk(filenames, tempdir, live):
+    # Merge one group of runs into a new run file. The inputs are removed
+    # by _merge_recastby_chunk_files as they are consumed; the new name is
+    # registered in `live` before it is written so that a failed write is
+    # still cleaned up by the caller.
+    f = NamedTemporaryFile(dir=tempdir, delete=False, mode='wb')
+    live.add(f.name)
+    mergeiter = _merge_recastby_chunk_files(filenames, live)
+    try:
+        for record in mergeiter:
+            _pickle_dump_recastby_record(record, f)
+        f.flush()
+    finally:
+        _safe_close(mergeiter, 'sort merge')
+        _safe_close(f, 'sort chunk')
+    return f.name
+
+
+def _reduce_recastby_runs(filenames, tempdir, live, fanin):
+    # Multi-pass reduction with a bounded fan-in: each pass merges groups
+    # of at most `fanin` runs into a single run file and deletes the
+    # inputs, so neither the number of open files nor the number of rows
+    # held in memory grows with the number of chunks.
+    # N.B., `live` may alias `filenames`; snapshot each pass's inputs so
+    # newly created runs are not picked up by the same pass.
+    inputs = list(filenames)
+    while len(inputs) > fanin:
+        reduced = []
+        for start in range(0, len(inputs), fanin):
+            group = inputs[start:start + fanin]
+            if len(group) == 1:
+                # nothing to merge, carry the run over unchanged
+                reduced.append(group[0])
+            else:
+                reduced.append(
+                    _dump_recastby_merged_chunk(group, tempdir, live))
+        inputs = reduced
+    return inputs
+
+
+def _unlink_recastby_file(fn):
+    try:
+        os.unlink(fn)
+    except Exception:
+        # Cleanup must never replace an exception from the source or
+        # from the caller's iteration.
+        logger.debug('exception deleting %s', fn, exc_info=True)
+        return False
+    return True
 
 
 def _unlink_recastby_files(filenames):
     for fn in filenames:
-        try:
-            os.unlink(fn)
-        except Exception:
-            # Cleanup must never replace an exception from the source or
-            # from the caller's iteration.
-            logger.debug('exception deleting %s', fn, exc_info=True)
+        _unlink_recastby_file(fn)
 
 
 def _iter_sorted_recastby_records(it, width, keyindices, buffersize,
                                   tempdir):
-    filenames = []
+    # `live` accumulates every file name created for this result iteration,
+    # including intermediate merge runs, so that cleanup can remove anything
+    # still present after an error or an early close. Names of runs that have
+    # already been consumed stay in the set; unlinking them again is
+    # harmless.
+    live = set()
     try:
         chunk, rownum = _read_recastby_chunk(
             it, width, keyindices, buffersize, 0)
@@ -929,20 +1043,22 @@ def _iter_sorted_recastby_records(it, width, keyindices, buffersize,
 
         # The first chunk filled the buffer, so there may be more data.
         while chunk:
-            _dump_recastby_chunk(chunk, tempdir, filenames)
+            _dump_recastby_chunk(chunk, tempdir, live)
             chunk, rownum = _read_recastby_chunk(
                 it, width, keyindices, buffersize, rownum)
             if chunk:
                 chunk.sort(key=_recastby_sortkey)
 
-        mergeiter = _merge_recastby_chunk_files(filenames)
+        filenames = _reduce_recastby_runs(
+            live, tempdir, live, _recastby_merge_fanin(buffersize))
+        mergeiter = _merge_recastby_chunk_files(filenames, live)
         try:
             for record in mergeiter:
                 yield record
         finally:
             _safe_close(mergeiter, 'sort merge')
     finally:
-        _unlink_recastby_files(filenames)
+        _unlink_recastby_files(live)
 
 
 def _recastby_field_index(indicator, field_index, fields):

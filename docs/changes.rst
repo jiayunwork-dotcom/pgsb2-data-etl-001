@@ -8,6 +8,11 @@ Version 1.7.32
   a fixed set of columns, with explicit ``duplicates`` (``error``/``first``/
   ``last``) and ``unknown`` (``error``/``ignore``) modes, stable original-input
   ordering, bounded-memory sorting, and a streaming ``presorted`` mode.
+  Spilled chunks are merged with a bounded fan-in, so the number of temporary
+  files open at once and the number of retained rows stay bounded as the
+  number of segments grows; consumed and intermediate runs are removed
+  promptly, and all resources are released on exhaustion, early close, or an
+  error.
 
 * Use PETL's mixed-type ordering for variable names discovered by
   ``recast()``, allowing tables with mixed-type headers to be melted and

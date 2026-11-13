@@ -838,3 +838,465 @@ def test_recastby_presorted_one_row_per_input_row():
                        duplicates='last', presorted=True))
     expect = [('id', 'a'), (1, 49), (2, 100)]
     assert _rows(it) == expect
+
+
+# ---------------------------------------------------------------------------
+# External sort with many spill chunks: bounded file descriptors, bounded
+# retained rows, and complete results verified independently.
+#
+# Small `buffersize` values force many spill chunks, well past the merge
+# fan-in, so the multi-pass reduction is exercised. These tests do not
+# depend on the fan-in constant's value.
+# ---------------------------------------------------------------------------
+
+
+def _collect(table):
+    return [tuple(r) for r in table]
+
+
+def _spill_source(nrows, key_mod=None):
+    """Header plus `nrows` molten rows in descending key order.
+
+    When `key_mod` is given, keys cycle through ``range(key_mod)`` so many
+    rows share a key and land in different spill chunks.
+    """
+    def source():
+        yield ('k', 'v', 'x')
+        for i in range(nrows, 0, -1):
+            yield (i % key_mod if key_mod else i, 'a', i)
+    return source()
+
+
+def _expected_recast(nrows, key_mod=None, keep='last'):
+    """Independently computed expected rows for `_spill_source`.
+
+    With `key_mod` set, several rows share a key. The source counts down,
+    so for ``keep='last'`` the latest input row is the smallest `i` of the
+    key; for ``keep='first'`` it is the largest `i`.
+    """
+    keys = sorted(set(i % key_mod if key_mod else i
+                      for i in range(1, nrows + 1)))
+    out = []
+    for key in keys:
+        rows = [i for i in range(1, nrows + 1)
+                if (i % key_mod if key_mod else i) == key]
+        value = min(rows) if keep == 'last' else max(rows)
+        out.append((key, value))
+    return out
+
+
+class _TrackedFile(object):
+    """Wraps a real run-file object to count concurrently open files."""
+
+    def __init__(self, f, counters):
+        self._file = f
+        self._counters = counters
+        counters['live'] += 1
+        counters['peak'] = max(counters['peak'], counters['live'])
+
+    def __getattr__(self, name):
+        return getattr(self._file, name)
+
+    def close(self):
+        f = self._file
+        if f is not None:
+            self._file = None
+            self._counters['live'] -= 1
+            f.close()
+
+
+def _tracked_open_probe(monkeypatch):
+    """Instrument the single place run files are opened."""
+    import petl.transform.reshape as rm
+    counters = {'live': 0, 'peak': 0, 'opens': 0, 'closes': 0}
+    real_open = rm._open_recastby_chunk_file
+
+    def tracking_open(fn):
+        counters['opens'] += 1
+        return _TrackedFile(real_open(fn), counters)
+
+    monkeypatch.setattr(rm, '_open_recastby_chunk_file', tracking_open)
+    return counters
+
+
+def test_recastby_subprocess_fd_limit_reproduction(tmpdir):
+    """Original reproduction: 600 segments, buffersize=2, 256 soft FD cap."""
+    import subprocess
+    import sys
+    import textwrap
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
+    script = textwrap.dedent('''
+        import os, sys
+        sys.path.insert(0, %r)
+        import petl as etl
+
+        tmpdir = sys.argv[1]
+        src = [('k', 'v', 'x')] + [(k, 'a', k) for k in range(600, 0, -1)]
+        rows = [tuple(r) for r in etl.recastby(
+            iter(src), 'k', 'v', 'x', ['a'], buffersize=2, tempdir=tmpdir)]
+        expected = [('k', 'a')] + [(k, k) for k in range(1, 601)]
+        assert rows == expected, (len(rows), rows[:3], rows[-3:])
+        # the script itself lives in the spill directory; only run files
+        # created by recastby must be gone
+        spills = [n for n in os.listdir(tmpdir) if n != 'repro.py']
+        assert spills == [], spills
+        print('OK')
+    ''' % (root,))
+    script_path = str(tmpdir.join('repro.py'))
+    with open(script_path, 'w') as f:
+        f.write(script)
+
+    prelude = (
+        'import resource\n'
+        'soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)\n'
+        'resource.setrlimit(resource.RLIMIT_NOFILE, (min(256, hard), hard))\n'
+        'import runpy\n'
+        'runpy.run_path(%r, run_name="__main__")\n' % (script_path,)
+    )
+    result = subprocess.run([sys.executable, '-c', prelude, str(tmpdir)],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout.decode().strip().endswith('OK')
+
+
+@pytest.mark.parametrize('nrows', [50, 400, 1500])
+@pytest.mark.parametrize('buffersize', [2, 3])
+def test_recastby_many_segments_full_result(nrows, buffersize, tmpdir):
+    """Multi-pass external processing produces the complete result."""
+    actual = _collect(recastby(_spill_source(nrows), 'k', 'v', 'x', ['a'],
+                               buffersize=buffersize, tempdir=str(tmpdir)))
+    assert actual[0] == ('k', 'a')
+    assert actual[1:] == _expected_recast(nrows)
+    assert os.listdir(str(tmpdir)) == []
+
+
+@pytest.mark.parametrize('keep', ['first', 'last'])
+def test_recastby_many_segments_shared_keys_original_order(keep, tmpdir):
+    """first/last across many chunks keep original input order."""
+    nrows = 400
+    actual = _collect(recastby(_spill_source(nrows, key_mod=5), 'k', 'v', 'x',
+                               ['a'], duplicates=keep, buffersize=2,
+                               tempdir=str(tmpdir)))
+    assert actual[0] == ('k', 'a')
+    assert actual[1:] == _expected_recast(nrows, key_mod=5, keep=keep)
+    assert os.listdir(str(tmpdir)) == []
+
+
+def test_recastby_many_segments_duplicate_row_number(tmpdir):
+    """A duplicate across a chunk boundary reports original row numbers."""
+    nrows = 200
+    table = [('k', 'v', 'x')]
+    for i in range(nrows, 0, -1):
+        table.append((i, 'a', i))
+    # add a duplicate of key 7 far from its first occurrence
+    table.append((7, 'a', 999))
+    # data row numbers count from 1 after the header; key 7 first appears
+    # at data row nrows - 7 + 1 == 194
+    view = recastby(table, 'k', 'v', 'x', ['a'], buffersize=3,
+                    tempdir=str(tmpdir))
+    with pytest.raises(ArgumentError) as exc:
+        _collect(view)
+    msg = str(exc.value)
+    assert 'data row %d' % (nrows - 7 + 1) in msg
+    assert 'data row %d' % (nrows + 1) in msg
+    assert "'a'" in msg
+    assert os.listdir(str(tmpdir)) == []
+
+
+@pytest.mark.parametrize('buffersize, max_peak', [(2, 16), (4, 16), (16, 64)])
+def test_recastby_many_segments_open_files_bounded(buffersize, max_peak,
+                                                   monkeypatch, tmpdir):
+    """Peak open run files is independent of the number of chunks."""
+    peaks = []
+    for nrows in (40, 400, 1600):
+        counters = _tracked_open_probe(monkeypatch)
+        actual = _collect(recastby(_spill_source(nrows), 'k', 'v', 'x',
+                                   ['a'], buffersize=buffersize,
+                                   tempdir=str(tmpdir)))
+        assert actual[1:] == _expected_recast(nrows)
+        assert counters['live'] == 0
+        assert counters['opens'] >= 2  # multi-pass merging really happened
+        assert os.listdir(str(tmpdir)) == []
+        peaks.append(counters['peak'])
+    # Both larger inputs produce more chunks than a single merge pass can
+    # consume, so the peak cannot grow with the segment count any further
+    # (a 4x larger input produces 4x more chunks), and it never exceeds the
+    # fixed fan-in.
+    assert peaks[1] == peaks[2]
+    assert max(peaks) <= max_peak
+
+
+class _RetainedPayload(object):
+    """Module-level (picklable) payload with live/peak reference counting."""
+
+    live = 0
+    peak = 0
+
+    def __init__(self, value):
+        self.value = value
+        _RetainedPayload.live += 1
+        _RetainedPayload.peak = max(_RetainedPayload.peak,
+                                    _RetainedPayload.live)
+
+    def __del__(self):
+        _RetainedPayload.live -= 1
+
+    def __eq__(self, other):
+        return (isinstance(other, _RetainedPayload)
+                and self.value == other.value)
+
+    def __reduce__(self):
+        return (_RetainedPayload, (self.value,))
+
+
+@pytest.mark.parametrize('nrows', [30, 400, 1500])
+def test_recastby_many_segments_retained_rows_bounded(nrows, tmpdir):
+    """The number of live value payloads stays bounded as chunks grow."""
+    def run(rows):
+        _RetainedPayload.live = _RetainedPayload.peak = 0
+
+        def source():
+            yield ('k', 'v', 'x')
+            for i in range(rows, 0, -1):
+                yield (i % 7, 'a', _RetainedPayload(i))
+
+        out = _collect(recastby(source(), 'k', 'v', 'x', ['a'],
+                                duplicates='last', buffersize=2,
+                                tempdir=str(tmpdir)))
+        assert out[0] == ('k', 'a')
+        return _RetainedPayload.peak
+
+    small = run(10)
+    probe = run(nrows)
+    # A constant number of records is live regardless of chunk count: the
+    # sort buffer plus one buffered record per merged run, not one per
+    # spilled chunk or one per group held for the whole merge.
+    assert probe <= small + 8
+    assert os.listdir(str(tmpdir)) == []
+
+
+def test_recastby_many_segments_early_close_cleanup(monkeypatch, tmpdir):
+    """Many-segment merge: early close frees files and the tracked handles."""
+    counters = _tracked_open_probe(monkeypatch)
+    table = [('k', 'v', 'x')] + [(i, 'a', i)
+                                 for i in range(500, 0, -1)]
+    it = iter(recastby(table, 'k', 'v', 'x', ['a'], buffersize=2,
+                       tempdir=str(tmpdir)))
+    assert next(it) == ('k', 'a')
+    assert next(it) == (1, 1)
+    assert os.listdir(str(tmpdir)) != []
+    it.close()
+    assert os.listdir(str(tmpdir)) == []
+    assert counters['live'] == 0
+
+
+def test_recastby_many_segments_source_error_cleanup(tmpdir):
+    """A source failure during spilling removes all chunk files."""
+    class Source(object):
+        def __iter__(self):
+            yield ('k', 'v', 'x')
+            for i in range(300, 0, -1):
+                yield (i, 'a', i)
+            raise RuntimeError('source boom')
+
+    with pytest.raises(RuntimeError, match='source boom'):
+        _collect(recastby(Source(), 'k', 'v', 'x', ['a'], buffersize=2,
+                          tempdir=str(tmpdir)))
+    assert os.listdir(str(tmpdir)) == []
+
+
+def test_recastby_many_segments_write_failure_cleanup(monkeypatch, tmpdir):
+    """An injected pickle failure while writing a chunk is cleaned up."""
+    import petl.transform.reshape as rm
+
+    calls = [0]
+    real_dump = rm._pickle_dump_recastby_record
+
+    def failing_dump(record, f):
+        calls[0] += 1
+        if calls[0] == 5:
+            raise OSError('disk full (injected)')
+        return real_dump(record, f)
+
+    monkeypatch.setattr(rm, '_pickle_dump_recastby_record', failing_dump)
+    table = [('k', 'v', 'x')] + [(i, 'a', i) for i in range(300, 0, -1)]
+    with pytest.raises(OSError, match='disk full'):
+        _collect(recastby(table, 'k', 'v', 'x', ['a'], buffersize=2,
+                          tempdir=str(tmpdir)))
+    assert os.listdir(str(tmpdir)) == []
+
+
+def test_recastby_merge_read_failure_cleanup(monkeypatch, tmpdir):
+    """A failure opening a run file mid-merge is cleaned up."""
+    import petl.transform.reshape as rm
+
+    table = [('k', 'v', 'x')] + [(i, 'a', i) for i in range(300, 0, -1)]
+
+    # First run clean to learn how many run files are opened in total.
+    counters = _tracked_open_probe(monkeypatch)
+    _collect(recastby(table, 'k', 'v', 'x', ['a'], buffersize=2,
+                      tempdir=str(tmpdir)))
+    total_opens = counters['opens']
+    assert total_opens > 2
+
+    real_open = rm._open_recastby_chunk_file
+    for fail_at in (2, 3, total_opens // 2, total_opens):
+        calls = [0]
+
+        def flaky_open(fn, fail_at=fail_at, calls=calls):
+            calls[0] += 1
+            if calls[0] == fail_at:
+                raise OSError('read failed (injected at %d)' % fail_at)
+            return real_open(fn)
+
+        monkeypatch.setattr(rm, '_open_recastby_chunk_file', flaky_open)
+        with pytest.raises(OSError, match='read failed'):
+            _collect(recastby(table, 'k', 'v', 'x', ['a'], buffersize=2,
+                              tempdir=str(tmpdir)))
+        assert os.listdir(str(tmpdir)) == []
+
+
+def test_recastby_merge_pickle_failure_cleanup(monkeypatch, tmpdir):
+    """A corrupt run file (pickle read failure) is cleaned up."""
+    import pickle as pickle_module
+    import petl.transform.reshape as rm
+
+    real_load = pickle_module.load
+    calls = [0]
+
+    def failing_load(f):
+        calls[0] += 1
+        if calls[0] > 2:
+            raise ValueError('corrupt chunk (injected)')
+        return real_load(f)
+
+    # _iter_recastby_chunk_file uses the module-level pickle.load imported
+    # into reshape, so patch there.
+    monkeypatch.setattr(rm.pickle, 'load', failing_load)
+    table = [('k', 'v', 'x')] + [(i, 'a', i) for i in range(300, 0, -1)]
+    with pytest.raises((ValueError, pickle_module.UnpicklingError)):
+        _collect(recastby(table, 'k', 'v', 'x', ['a'], buffersize=2,
+                          tempdir=str(tmpdir)))
+    assert os.listdir(str(tmpdir)) == []
+
+
+def test_recastby_many_segments_interleaved_iterators_independent(
+        monkeypatch, tmpdir):
+    """Interleaved result iterators have separate files and cleanup."""
+    d1 = str(tmpdir.join('a'))
+    d2 = str(tmpdir.join('b'))
+    os.mkdir(d1)
+    os.mkdir(d2)
+    table = [('k', 'v', 'x')] + [(i, 'a', i) for i in range(200, 0, -1)]
+    view = recastby(table, 'k', 'v', 'x', ['a'], buffersize=2, tempdir=d1)
+    it1 = iter(view)
+    it2 = iter(view)
+    assert next(it1) == ('k', 'a')
+    assert next(it2) == ('k', 'a')
+    assert next(it1) == (1, 1)
+    # a second view shares no state with the first
+    view2 = recastby(_spill_source(150), 'k', 'v', 'x', ['a'],
+                     buffersize=2, tempdir=d2)
+    it3 = iter(view2)
+    assert next(it3) == ('k', 'a')
+    assert next(it3) == (1, 1)
+    # closing one must not disturb the others or their directories
+    it1.close()
+    assert os.listdir(d1) == []
+    assert next(it2) == (1, 1)  # it2 had only consumed its header
+    assert next(it3) == (2, 2)
+    assert os.listdir(d2) != []
+    it2.close()
+    it3.close()
+    assert os.listdir(d1) == []
+    assert os.listdir(d2) == []
+
+
+def test_recastby_many_segments_source_closed_after_early_close(tmpdir):
+    """The source iterator is closed even when the result is closed early
+    in a multi-pass external sort."""
+    events = []
+
+    class Source(object):
+        def __iter__(self):
+            events.append('open')
+            return self._gen()
+
+        def _gen(self):
+            try:
+                yield ('k', 'v', 'x')
+                for i in range(200, 0, -1):
+                    yield (i, 'a', i)
+            finally:
+                events.append('closed')
+
+    it = iter(recastby(Source(), 'k', 'v', 'x', ['a'], buffersize=2,
+                       tempdir=str(tmpdir)))
+    assert next(it) == ('k', 'a')
+    assert events == ['open']
+    it.close()
+    assert events == ['open', 'closed']
+    assert os.listdir(str(tmpdir)) == []
+
+
+def test_recastby_many_segments_compound_and_none_keys(tmpdir):
+    """Compound keys and None keys survive multi-pass external sorting."""
+    table = [('a', 'b', 'v', 'x')]
+    for i in range(200, 0, -1):
+        table.append((None if i % 10 == 0 else i % 4, i % 3, 'v', i))
+    out = _collect(recastby(table, ['a', 'b'], 'v', 'x', ['v'],
+                            duplicates='last', buffersize=2,
+                            tempdir=str(tmpdir)))
+
+    # independent expectation: group by (a, b), keys in PETL order with
+    # None first, and keep the latest input row (smallest i, reverse source)
+    groups = {}
+    for i in range(200, 0, -1):
+        key = (None if i % 10 == 0 else i % 4, i % 3)
+        groups.setdefault(key, []).append(i)
+    keys = sorted(groups, key=lambda k: (
+        (0, 0) if k[0] is None else (1, k[0]), k[1]))
+    assert out[0] == ('a', 'b', 'v')
+    assert out[1:] == [(k[0], k[1], min(groups[k])) for k in keys]
+    assert os.listdir(str(tmpdir)) == []
+
+
+def test_recastby_many_segments_unknown_ignore_only_unknown(tmpdir):
+    """unknown='ignore' keeps keys that have only unknown indicators even
+    when the keys are spread over many chunks."""
+    table = [('k', 'v', 'x')]
+    for i in range(400, 0, -1):
+        table.append((i, 'zzz', i))          # only unknown
+        table.append((i, 'a', i * 1000))     # known
+    out = _collect(recastby(table, 'k', 'v', 'x', ['a'], unknown='ignore',
+                            buffersize=2, tempdir=str(tmpdir)))
+    assert out == [('k', 'a')] + [(i, i * 1000) for i in range(1, 401)]
+    assert os.listdir(str(tmpdir)) == []
+
+    # a table where every key is only unknown still emits one row per key
+    table2 = [('k', 'v', 'x')] + [(i, 'zzz', i)
+                                  for i in range(50, 0, -1)]
+    out2 = _collect(recastby(table2, 'k', 'v', 'x', ['a'],
+                             unknown='ignore', missing='M', buffersize=2,
+                             tempdir=str(tmpdir)))
+    assert out2 == [('k', 'a')] + [(i, 'M') for i in range(1, 51)]
+    assert os.listdir(str(tmpdir)) == []
+
+
+def test_recastby_header_only_and_small_sort_consistent(tmpdir):
+    """Header-only, in-memory, and spilled runs agree on header/order."""
+    header_only = [('k', 'v', 'x')]
+    for kwargs in ({}, {'buffersize': 1}):
+        assert _collect(recastby(header_only, 'k', 'v', 'x', ['a'],
+                                 tempdir=str(tmpdir), **kwargs)) == \
+            [('k', 'a')]
+
+    small = [('k', 'v', 'x'), (3, 'a', 30), (1, 'a', 10), (2, 'a', 20)]
+    expect = [('k', 'a'), (1, 10), (2, 20), (3, 30)]
+    assert _collect(recastby(small, 'k', 'v', 'x', ['a'])) == expect
+    assert _collect(recastby(small, 'k', 'v', 'x', ['a'], buffersize=1,
+                             tempdir=str(tmpdir))) == expect
+    assert os.listdir(str(tmpdir)) == []
