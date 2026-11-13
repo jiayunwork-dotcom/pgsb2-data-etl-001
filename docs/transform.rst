@@ -253,6 +253,11 @@ Validation
 .. module:: petl.transform.intervals
 .. _transform_intervals:
 
+Intervals
+---------
+
+.. autofunction:: petl.transform.intervals.intervaljoinstream
+
 Intervals (intervaltree)
 ------------------------
 

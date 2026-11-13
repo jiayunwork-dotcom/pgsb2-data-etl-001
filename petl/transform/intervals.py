@@ -1,12 +1,18 @@
 from __future__ import absolute_import, print_function, division
 
 
+import math
+import os
+import sqlite3
+import tempfile
+from decimal import Decimal, localcontext
 from operator import itemgetter, attrgetter
-from petl.compat import text_type
+from petl.compat import text_type, string_types, pickle
 
 
 from petl.util.base import asindices, records, Table, values, rowgroupby
-from petl.errors import DuplicateKeyError
+from petl.comparison import Comparable
+from petl.errors import ArgumentError, DuplicateKeyError, FieldSelectionError
 from petl.transform.basics import addfield
 from petl.transform.sorts import sort
 
@@ -673,6 +679,656 @@ class IntervalLeftJoinView(Table):
             leftouter=True
         )
         
+
+def intervaljoinstream(left, right, lstart='start', lstop='stop',
+                       rstart='start', rstop='stop', by=None, how='inner',
+                       presorted=False, buffersize=1000, tempdir=None,
+                       lprefix=None, rprefix='right_', missing=None):
+    """
+    Join two tables by overlapping intervals, with bounded in-memory state.
+
+    Intervals use half-open semantics: start coordinates are included and stop
+    coordinates are excluded.  Touching endpoints therefore do not overlap.
+    Rows are paired only when their group values are equal and their intervals
+    have a non-empty intersection.  Every pair is emitted, including pairs
+    produced by duplicated rows.
+
+    Unlike :func:`intervaljoin`, this transform does not build an in-memory
+    interval tree for the whole right table.  When the inputs are not already
+    sorted, rows are staged in a temporary on-disk SQLite database and merged
+    with a bounded number of records retained in memory.  When
+    ``presorted=True`` the inputs are consumed in their supplied order and
+    matches are emitted as soon as the relevant interval boundaries have been
+    confirmed.
+
+    The output contains all left fields followed by the right non-group
+    fields.  Rows are ordered by the group fields and left start coordinate;
+    matches belonging to one left row are contiguous and ordered by right
+    start, retaining original input order for equal starts.  With
+    ``how='left'``, an unmatched left row is emitted once with right fields
+    set to `missing`.
+
+    The view is lazy: constructing it and calling :func:`iter` do not read
+    either source.  Each traversal requests one iterator from each source and
+    uses independent join state.  Unsorted inputs are staged in a temporary
+    SQLite database with bounded in-memory cache, spilling to `tempdir` when
+    needed; with ``presorted=True`` no whole-table sort is performed and
+    matches are emitted after only the lookahead needed to establish interval
+    boundaries.
+
+    """
+
+    return IntervalJoinStreamView(
+        left, right, lstart=lstart, lstop=lstop, rstart=rstart,
+        rstop=rstop, by=by, how=how, presorted=presorted,
+        buffersize=buffersize, tempdir=tempdir, lprefix=lprefix,
+        rprefix=rprefix, missing=missing)
+
+
+Table.intervaljoinstream = intervaljoinstream
+
+
+class IntervalJoinStreamView(Table):
+
+    def __init__(self, left, right, lstart='start', lstop='stop',
+                 rstart='start', rstop='stop', by=None, how='inner',
+                 presorted=False, buffersize=1000, tempdir=None,
+                 lprefix=None, rprefix='right_', missing=None):
+        self.left = left
+        self.right = right
+        self.lstart = lstart
+        self.lstop = lstop
+        self.rstart = rstart
+        self.rstop = rstop
+        self.by = by
+        self.how = how
+        self.presorted = presorted
+        self.buffersize = buffersize
+        self.tempdir = tempdir
+        self.lprefix = lprefix
+        self.rprefix = rprefix
+        self.missing = missing
+
+    def __iter__(self):
+        return iterintervaljoinstream(
+            self.left, self.right, self.lstart, self.lstop, self.rstart,
+            self.rstop, self.by, self.how, self.presorted, self.buffersize,
+            self.tempdir, self.lprefix, self.rprefix, self.missing)
+
+    def __len__(self):
+        # ``list(view)`` otherwise uses the inherited length hint and performs
+        # a complete extra source traversal before allocation.
+        raise TypeError('length of a streaming interval join is not known '
+                        'without iterating it')
+
+
+def _stream_check_buffersize(buffersize):
+    if not isinstance(buffersize, int) or isinstance(buffersize, bool) \
+            or buffersize < 1:
+        raise ArgumentError(
+            'buffersize must be a positive integer, got %r'
+            % (buffersize,))
+
+
+def _stream_group_fields(by):
+    if by is None:
+        return ()
+    if isinstance(by, string_types):
+        fields = (by,)
+    else:
+        try:
+            fields = tuple(by)
+        except TypeError:
+            raise ArgumentError(
+                'by must be a field name or non-empty sequence of field names')
+    if not fields:
+        raise ArgumentError(
+            'by must be a field name or non-empty sequence of field names')
+    for i, field in enumerate(fields):
+        if not isinstance(field, string_types):
+            raise ArgumentError('invalid group field: %r' % (field,))
+        if field in fields[:i]:
+            raise ArgumentError('duplicate group field: %r' % (field,))
+    return fields
+
+
+def _stream_single_field(name, label):
+    if not isinstance(name, string_types):
+        raise ArgumentError('%s must be a single field name: %r'
+                            % (label, name))
+    return name
+
+
+def _stream_header(hdr, side):
+    try:
+        fields = tuple(hdr)
+    except TypeError:
+        raise ArgumentError('%s header must be a sequence of strings' % side)
+    if not all(isinstance(f, str) for f in fields):
+        raise ArgumentError('%s header fields must be strings' % side)
+    if not fields:
+        raise ArgumentError('%s table has no header row' % side)
+    for i, field in enumerate(fields):
+        if field in fields[:i]:
+            raise ArgumentError(
+                'duplicate %s header field: %r' % (side, field))
+    return fields
+
+
+def _stream_field_index(fields, name, side, label):
+    try:
+        return fields.index(name)
+    except ValueError:
+        raise FieldSelectionError(
+            '%s field %r not found in %s header %r'
+            % (label, name, side, fields))
+
+
+def _stream_check_width(row, rownum, side, width):
+    if len(row) != width:
+        raise ArgumentError(
+            '%s data row %d has %d values but the header has %d fields'
+            % (side, rownum, len(row), width))
+
+
+def _stream_check_group(value, rownum, side):
+    if value is not None and not isinstance(value, (str, int)):
+        raise ArgumentError(
+            '%s data row %d has an invalid group value: %r'
+            % (side, rownum, value))
+    if isinstance(value, bool):
+        raise ArgumentError(
+            '%s data row %d has an invalid group value: %r'
+            % (side, rownum, value))
+
+
+def _stream_check_coordinate(value, rownum, side, label):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value):
+        raise ArgumentError(
+            '%s data row %d has an invalid %s coordinate: %r'
+            % (side, rownum, label, value))
+
+
+def _stream_check_interval(row, rownum, side, startidx, stopidx, groupidx):
+    start = row[startidx]
+    stop = row[stopidx]
+    _stream_check_coordinate(start, rownum, side, 'start')
+    _stream_check_coordinate(stop, rownum, side, 'stop')
+    if not start < stop:
+        raise ArgumentError(
+            '%s data row %d has start >= stop: %r >= %r'
+            % (side, rownum, start, stop))
+    for idx in groupidx:
+        _stream_check_group(row[idx], rownum, side)
+
+
+def _stream_output_header(lfields, rfields, groupindices, lprefix, rprefix):
+    if lprefix is None:
+        out = list(lfields)
+    else:
+        out = [lprefix + f for f in lfields]
+    for idx, field in enumerate(rfields):
+        if idx not in groupindices:
+            out.append(field if rprefix is None else rprefix + field)
+    for i, field in enumerate(out):
+        if field in out[:i]:
+            raise ArgumentError('duplicate output field: %r' % (field,))
+    return tuple(out)
+
+
+def _stream_order_key(group, start):
+    # Allowed group values map naturally onto Comparable's existing
+    # relaxed ordering semantics.
+    if len(group) == 1:
+        return (Comparable(group[0]), start)
+    return (Comparable(group), start)
+
+
+def _stream_validate_row(row, rownum, side, width, startidx, stopidx,
+                         groupindices):
+    row = tuple(row)
+    _stream_check_width(row, rownum, side, width)
+    _stream_check_interval(row, rownum, side, startidx, stopidx, groupindices)
+    return row
+
+
+def _stream_encode_unsigned(value):
+    # One leading length byte followed by big-endian value bytes keeps both
+    # small and multi-byte integers lexically ordered.
+    body = []
+    while value:
+        body.append(value & 0xff)
+        value >>= 8
+    body.reverse()
+    return bytes((len(body),)) + bytes(body)
+
+
+def _stream_encode_signed(value):
+    encoded = _stream_encode_unsigned(abs(value))
+    if value < 0:
+        return b'\x00' + encoded
+    if value == 0:
+        return b'\x01' + encoded
+    return b'\x02' + encoded
+
+
+def _stream_numeric_key(value):
+    if value == 0:
+        return b'\x01'
+    with localcontext() as context:
+        # Avoid Decimal's default 28-digit precision truncating very large
+        # integer coordinates during normalization.
+        context.prec = max(40, len(str(abs(int(value))))
+                           if isinstance(value, int) else 40)
+        decimal_value = Decimal(repr(float(value))
+                                if isinstance(value, float) else value)
+        sign, digits, exponent = decimal_value.normalize().as_tuple()
+    digit_text = ''.join(str(d) for d in digits)
+    magnitude_exponent = exponent + len(digits) - 1
+    width = max(39, len(digit_text))
+    padded_digits = digit_text.ljust(width, chr(0)).encode('ascii')
+    body = (_stream_encode_signed(magnitude_exponent) + bytes((0xff,))
+            + padded_digits)
+    if sign:
+        return b'\x00' + bytes(255 - b for b in body)
+    return b'\x02' + body
+
+
+def _stream_open_database(tempdir, buffersize):
+    if tempdir is not None and (not isinstance(tempdir, string_types)
+                                or not os.path.isdir(tempdir)):
+        raise ArgumentError('tempdir must be an existing directory or None')
+    # One database file and one connection mean the number of open data files
+    # does not depend on the number of sort chunks or emitted matches.
+    fd, filename = tempfile.mkstemp(prefix='petl-interval-join-',
+                                    suffix='.sqlite', dir=tempdir)
+    os.close(fd)
+    connection = sqlite3.connect(filename, isolation_level=None)
+    connection.execute('PRAGMA journal_mode = OFF')
+    connection.execute('PRAGMA synchronous = OFF')
+    # Keep SQLite's own page cache small and fixed; records above the caller's
+    # buffer remain on disk rather than in Python lists.
+    connection.execute('PRAGMA cache_size = %d' % min(buffersize, 16))
+    connection.execute('PRAGMA temp_store = FILE')
+    if tempdir is not None:
+        connection.execute('PRAGMA temp_store_directory = %s'
+                           % _stream_sqlite_quote(tempdir))
+    return connection, filename
+
+
+def _stream_sqlite_quote(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _stream_group_columns(prefix, ngroups):
+    if not ngroups:
+        return ''
+    return ', ' + ', '.join('%sg%d TEXT' % (prefix, i)
+                            for i in range(ngroups))
+
+
+def _stream_prepare_database(connection, ngroups):
+    connection.execute(
+        'CREATE TABLE right_stage ('
+        'id INTEGER PRIMARY KEY, seq INTEGER, start_key BLOB, stop_key BLOB'
+        + _stream_group_columns('', ngroups) + ', row BLOB)')
+    connection.execute(
+        'CREATE TABLE left_stage ('
+        'id INTEGER PRIMARY KEY, seq INTEGER, start_key BLOB, stop_key BLOB'
+        + _stream_group_columns('', ngroups) + ', row BLOB)')
+    index_columns = ['start_key', 'seq']
+    if ngroups:
+        index_columns = ['g%d' % i for i in range(ngroups)] + index_columns
+    connection.execute(
+        'CREATE INDEX right_stage_lookup ON right_stage(%s)'
+        % ', '.join(index_columns))
+
+
+def _stream_group_sql(ngroups):
+    if not ngroups:
+        return '', []
+    cols = ', '.join('g%d' % i for i in range(ngroups))
+    return ', ' + cols, [None] * ngroups
+
+
+def _stream_insert(connection, table, record_id, seq, start, stop, groups,
+                   row, ngroups):
+    gcols, _ = _stream_group_sql(ngroups)
+    placeholders = ', '.join('?' for _ in range(5 + ngroups))
+    connection.execute(
+        'INSERT INTO %s (id, seq, start_key, stop_key%s, row) VALUES (%s)'
+        % (table, gcols, placeholders),
+        [record_id, seq, _stream_numeric_key(start),
+         _stream_numeric_key(stop)] + list(groups)
+        + [pickle.dumps(row, protocol=-1)])
+
+
+def _stream_load_sorted_table(connection, iterator, side, width, startidx,
+                              stopidx, groupindices, ngroups, buffersize,
+                              table, presorted):
+    rownum = 0
+    in_transaction = False
+    try:
+        for row in iterator:
+            if not in_transaction:
+                connection.execute('BEGIN')
+                in_transaction = True
+            rownum += 1
+            row = _stream_validate_row(row, rownum, side, width, startidx,
+                                       stopidx, groupindices)
+            groups = tuple(row[i] for i in groupindices)
+            _stream_insert(connection, table, rownum, rownum,
+                           row[startidx], row[stopidx], groups, row, ngroups)
+            if rownum % buffersize == 0:
+                connection.execute('COMMIT')
+                in_transaction = False
+        if in_transaction:
+            connection.execute('COMMIT')
+    except Exception:
+        if in_transaction:
+            connection.rollback()
+        raise
+    if not presorted and table != 'right_stage':
+        order = ', '.join(['g%d' % i for i in range(ngroups)] +
+                          ['start_key', 'seq'])
+        connection.execute(
+            'CREATE INDEX %s_order ON %s(%s)'
+            % (table, table, order))
+
+
+def _stream_group_clause(ngroups, suffix):
+    if not ngroups:
+        return ''
+    return ' AND '.join('g%d IS ?%s' % (i, suffix) for i in range(ngroups))
+
+
+def _stream_active_matches(connection, groups, start, stop, ngroups):
+    start_key = _stream_numeric_key(start)
+    stop_key = _stream_numeric_key(stop)
+    where = ['start_key < ?', 'stop_key > ?']
+    values = [stop_key, start_key]
+    clause = _stream_group_clause(ngroups, '')
+    if clause:
+        where.append(clause)
+        values.extend(groups)
+    sql = ('SELECT row FROM right_stage WHERE ' + ' AND '.join(where)
+           + ' ORDER BY start_key, seq')
+    cursor = connection.execute(sql, values)
+    # The sqlite3 module pre-fetches this many rows; keep it fixed so the
+    # number of rows held for a large match set does not grow with input size.
+    cursor.arraysize = 32
+    return cursor
+
+
+def _stream_presorted_groups(row, groupindices):
+    return tuple(row[i] for i in groupindices) if groupindices else ()
+
+
+def _stream_check_order(previous, current, rownum, side):
+    if previous is not None:
+        prev_groups, prev_start, prev_seq = previous
+        cur_key = _stream_order_key(current[0], current[1])
+        prev_key = _stream_order_key(prev_groups, prev_start)
+        if cur_key < prev_key:
+            raise ArgumentError(
+                '%s input is out of order at data row %d' % (side, rownum))
+
+
+def _stream_join_presorted(connection, leftit, rightit, lwidth, rwidth,
+                           lstartidx, lstopidx, rstartidx, rstopidx,
+                           lgroupidx, rgroupidx, ngroups, how, missing,
+                           rfields, routindices):
+    lrownum = 0
+    rrownum = 0
+    prev_left = None
+    prev_right = None
+    right_exhausted = False
+
+    def next_left():
+        nonlocal lrownum, prev_left
+        row = next(leftit)
+        lrownum += 1
+        row = _stream_validate_row(row, lrownum, 'left', lwidth, lstartidx,
+                                   lstopidx, lgroupidx)
+        groups = _stream_presorted_groups(row, lgroupidx)
+        _stream_check_order(prev_left, (groups, row[lstartidx]), lrownum,
+                            'left')
+        prev_left = (groups, row[lstartidx], lrownum)
+        return groups, row
+
+    def next_right():
+        nonlocal rrownum, prev_right
+        row = next(rightit)
+        rrownum += 1
+        row = _stream_validate_row(row, rrownum, 'right', rwidth, rstartidx,
+                                   rstopidx, rgroupidx)
+        groups = _stream_presorted_groups(row, rgroupidx)
+        _stream_check_order(prev_right, (groups, row[rstartidx]), rrownum,
+                            'right')
+        prev_right = (groups, row[rstartidx], rrownum)
+        return groups, row
+
+    pending = None
+    while True:
+        try:
+            groups, lrow = next_left()
+        except StopIteration:
+            break
+
+        # Re-consume a retained boundary right row first.
+        if pending is not None:
+            rid, lg, rrow = pending
+            same_group = not ngroups or tuple(lg) == tuple(groups)
+            if not same_group and ngroups and \
+                    Comparable(lg) < Comparable(groups):
+                # A boundary retained for the previous left group cannot
+                # overlap any row in this or later groups.
+                pending = None
+            elif same_group and rrow[rstartidx] < lrow[lstopidx]:
+                _stream_insert(connection, 'right_stage', rid, rid,
+                               rrow[rstartidx], rrow[rstopidx], lg, rrow,
+                               ngroups)
+                pending = None
+
+        while pending is None and not right_exhausted:
+            try:
+                rgroups, rrow = next_right()
+            except StopIteration:
+                right_exhausted = True
+                break
+            rid = rrownum
+            if ngroups and Comparable(rgroups) < Comparable(groups):
+                # A right group without a later left row can never match.
+                continue
+            if ngroups and Comparable(rgroups) > Comparable(groups):
+                # Keep one future-group lookahead.  It will be reconsidered
+                # when the left table reaches that group.
+                pending = (rid, rgroups, rrow)
+                break
+            if rrow[rstartidx] >= lrow[lstopidx]:
+                pending = (rid, rgroups, rrow)
+                break
+            _stream_insert(connection, 'right_stage', rid, rid,
+                           rrow[rstartidx], rrow[rstopidx], rgroups, rrow,
+                           ngroups)
+
+        cursor = _stream_active_matches(
+            connection, groups, lrow[lstartidx], lrow[lstopidx], ngroups)
+        matched = False
+        try:
+            for (blob,) in cursor:
+                rrow = pickle.loads(blob)
+                matched = True
+                yield _stream_output_row(lrow, rrow, routindices)
+        finally:
+            cursor.close()
+        if how == 'left' and not matched:
+            yield _stream_missing_row(lrow, rfields, routindices, missing)
+
+    # Exhaustion must validate every remaining right row, including an
+    # unmatched or invalid tail.  The retained pending row has already been
+    # read and validated.
+    while not right_exhausted:
+        try:
+            next_right()
+        except StopIteration:
+            right_exhausted = True
+
+
+def _stream_output_row(lrow, rrow, routindices):
+    return tuple(lrow) + tuple(rrow[i] for i in routindices)
+
+
+def _stream_missing_row(lrow, rfields, routindices, missing):
+    return tuple(lrow) + tuple(missing for _ in routindices)
+
+
+def _stream_unsorted_order_sql(ngroups):
+    return ', '.join(['g%d' % i for i in range(ngroups)] +
+                     ['start_key', 'seq'])
+
+
+def _stream_join_staged(connection, ngroups, how, missing, routindices,
+                        lstartidx, lstopidx):
+    order = _stream_unsorted_order_sql(ngroups)
+    group_select = ', '.join('g%d' % i for i in range(ngroups)) \
+        if ngroups else 'NULL'
+    lcursor = connection.execute(
+        'SELECT row, %s FROM left_stage ORDER BY %s'
+        % (group_select, order))
+    try:
+        record = lcursor.fetchone()
+        while record is not None:
+            lblob = record[0]
+            groups = tuple(record[1:])
+            lrow = pickle.loads(lblob)
+            lstart = lrow[lstartidx]
+            lstop = lrow[lstopidx]
+            cursor = _stream_active_matches(connection, groups, lstart,
+                                            lstop, ngroups)
+            matched = False
+            try:
+                for match in cursor:
+                    rblob = match[0]
+                    matched = True
+                    yield _stream_output_row(lrow, pickle.loads(rblob),
+                                             routindices)
+            finally:
+                cursor.close()
+            if how == 'left' and not matched:
+                yield _stream_missing_row(lrow, None, routindices, missing)
+            record = lcursor.fetchone()
+    finally:
+        lcursor.close()
+
+
+def _stream_safe_close(obj, label):
+    close = getattr(obj, 'close', None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:
+        # Cleanup must not mask an exception from the source or transform.
+        pass
+
+
+def iterintervaljoinstream(left, right, lstart, lstop, rstart, rstop, by,
+                           how, presorted, buffersize, tempdir, lprefix,
+                           rprefix, missing):
+    if how not in ('inner', 'left'):
+        raise ArgumentError("how must be 'inner' or 'left', got %r" % (how,))
+    if not isinstance(presorted, bool):
+        raise ArgumentError('presorted must be True or False')
+    _stream_check_buffersize(buffersize)
+    group_fields = _stream_group_fields(by)
+    lstart = _stream_single_field(lstart, 'lstart')
+    lstop = _stream_single_field(lstop, 'lstop')
+    rstart = _stream_single_field(rstart, 'rstart')
+    rstop = _stream_single_field(rstop, 'rstop')
+    if lstart == lstop:
+        raise ArgumentError('lstart and lstop must name different fields')
+    if rstart == rstop:
+        raise ArgumentError('rstart and rstop must name different fields')
+
+    leftit = None
+    rightit = None
+    connection = None
+    dbname = None
+
+    def close_resources():
+        _stream_safe_close(leftit, 'left source')
+        _stream_safe_close(rightit, 'right source')
+        if connection is not None:
+            _stream_safe_close(connection, 'temporary database')
+        if dbname is not None:
+            try:
+                os.unlink(dbname)
+            except OSError:
+                pass
+
+    try:
+        leftit = iter(left)
+        rightit = iter(right)
+        try:
+            lhdr = next(leftit)
+        except StopIteration:
+            raise ArgumentError('left table has no header row')
+        try:
+            rhdr = next(rightit)
+        except StopIteration:
+            raise ArgumentError('right table has no header row')
+
+        lfields = _stream_header(lhdr, 'left')
+        rfields = _stream_header(rhdr, 'right')
+        lstartidx = _stream_field_index(lfields, lstart, 'left', 'lstart')
+        lstopidx = _stream_field_index(lfields, lstop, 'left', 'lstop')
+        rstartidx = _stream_field_index(rfields, rstart, 'right', 'rstart')
+        rstopidx = _stream_field_index(rfields, rstop, 'right', 'rstop')
+        lgroupidx = [_stream_field_index(lfields, f, 'left', 'group')
+                     for f in group_fields]
+        rgroupidx = [_stream_field_index(rfields, f, 'right', 'group')
+                     for f in group_fields]
+        if lstartidx in lgroupidx or lstopidx in lgroupidx:
+            raise ArgumentError(
+                'left interval fields cannot overlap group fields')
+        if rstartidx in rgroupidx or rstopidx in rgroupidx:
+            raise ArgumentError(
+                'right interval fields cannot overlap group fields')
+
+        routindices = tuple(i for i in range(len(rfields))
+                            if i not in rgroupidx)
+        outhdr = _stream_output_header(lfields, rfields, set(rgroupidx),
+                                       lprefix, rprefix)
+        yield outhdr
+
+        ngroups = len(group_fields)
+        connection, dbname = _stream_open_database(tempdir, buffersize)
+        _stream_prepare_database(connection, ngroups)
+
+        if presorted:
+            for outrow in _stream_join_presorted(
+                    connection, leftit, rightit, len(lfields), len(rfields),
+                    lstartidx, lstopidx, rstartidx, rstopidx, lgroupidx,
+                    rgroupidx, ngroups, how, missing, rfields, routindices):
+                yield outrow
+        else:
+            _stream_load_sorted_table(
+                connection, leftit, 'left', len(lfields), lstartidx,
+                lstopidx, lgroupidx, ngroups, buffersize, 'left_stage',
+                presorted)
+            _stream_load_sorted_table(
+                connection, rightit, 'right', len(rfields), rstartidx,
+                rstopidx, rgroupidx, ngroups, buffersize, 'right_stage',
+                presorted)
+            for outrow in _stream_join_staged(
+                    connection, ngroups, how, missing, routindices,
+                    lstartidx, lstopidx):
+                yield outrow
+    finally:
+        close_resources()
+
 
 def intervalantijoin(left, right, lstart='start', lstop='stop', rstart='start',
                      rstop='stop', lkey=None, rkey=None, include_stop=False,
