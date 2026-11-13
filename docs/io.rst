@@ -101,6 +101,84 @@ Delimited files
 .. autofunction:: petl.io.csv.teetsv
 
 
+.. module:: petl.io.partitioned
+.. _io_partitioned:
+
+Partitioned datasets
+^^^^^^^^^^^^^^^^^^^^
+
+A partitioned dataset is a directory tree laid out in the Hive style: one
+level of nested directories per partition field, each named
+``field=encoded_value``, with UTF-8 CSV data files (standard library
+``excel`` dialect) inside the leaf partition directories. Data files contain
+only the non-partition fields; the partition values are represented entirely
+by the directory structure and are restored as columns when the dataset is
+read. Every dataset also carries a hidden metadata directory
+(``_petl_partitioned``) holding the committed manifest, a commit lock and
+staging area; data file names never start with ``_`` or ``.``.
+
+Partition values may be ``str``, ``int`` (``bool`` is rejected) or ``None``.
+Integers are written as decimal strings and ``None`` becomes the default
+partition marker ``__HIVE_DEFAULT_PARTITION__`` (a string value equal to
+that marker is rejected). Control characters (``U+0000``–``U+001F``),
+``U+007F`` and the punctuation characters ``" # % ' * / : = ? \ [ ] ^ { }``
+are percent-encoded as uppercase ``%XX`` UTF-8 bytes; spaces and non-ASCII
+characters are left untouched. The empty string is a legal partition value.
+
+Writes are published as atomic, versioned commits. Readers using
+:func:`petl.io.partitioned.frompartitioned` are pinned to the version that
+was committed when their iteration started: they either read that whole
+version or raise :class:`petl.errors.PartitionCommitConflict`, never a
+mixture of versions and never a silently truncated result. A write that
+fails for any reason (a source exception, a malformed row, an invalid
+partition value, a disk error or ``KeyboardInterrupt``) leaves the previous
+version readable and removes its temporary files; if the process is killed
+hard mid-write, the previous version is still readable and the orphaned
+staging files are never read or mistaken for data. Concurrent writers
+serialise through a lock; a writer whose base version was changed by
+another writer before it commits fails with
+:class:`petl.errors.PartitionCommitConflict` and the other writer's result
+is preserved.
+
+The write modes are:
+
+* ``error`` (default): create a new dataset. If a dataset already exists at
+  the root, an :class:`petl.errors.ArgumentError` is raised before any data
+  rows are read.
+* ``overwrite``: replace the whole dataset with the new contents.
+* ``overwrite_partitions``: replace only the partitions present in the
+  input; all other partitions are kept. An empty input leaves the dataset
+  unchanged.
+* ``append``: append rows to existing partitions, creating new partitions as
+  needed.
+
+For the last three modes, a missing root means a new dataset is created.
+When writing into an existing dataset, both the non-partition header fields
+and the ``partition_by`` fields must match the existing schema. A root that
+exists, is non-empty and is not a partitioned dataset is rejected by every
+mode and none of its files are deleted.
+
+At most ``max_open_files`` data files are open at any moment, so datasets
+with far more partitions than open file handles can still be written even
+when partitions arrive out of order; rows keep their relative input order
+within each partition. The input table is traversed exactly once and memory
+use is proportional to the number of distinct partitions rather than the
+number of rows. Repeated ``overwrite`` or ``overwrite_partitions`` writes
+remove files no longer referenced by the manifest, so on-disk file count and
+size do not grow with the number of writes.
+
+When read back, the header is the non-partition fields followed by the
+partition fields; partition values are restored as strings (with the default
+partition marker restored to ``None``) and data fields are strings as
+produced by CSV. Partitions are ordered by their partition value tuple using
+petl's comparison semantics (``None`` sorts first); within a partition,
+rows are ordered by commit and then by their original input order. An empty
+dataset yields its header only.
+
+.. autofunction:: petl.io.partitioned.topartitioned
+.. autofunction:: petl.io.partitioned.frompartitioned
+
+
 .. module:: petl.io.pickle
 .. _io_pickle:
 

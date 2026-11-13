@@ -9,6 +9,8 @@ from petl.io.sources import FileSource, GzipSource, BZ2Source, ZipSource, \
 from petl.io.csv import fromcsv, fromtsv, tocsv, appendcsv, totsv, appendtsv, \
     teecsv, teetsv
 
+from petl.io.partitioned import frompartitioned, topartitioned
+
 from petl.io.pickle import frompickle, topickle, appendpickle, teepickle
 
 from petl.io.text import fromtext, totext, appendtext, teetext
