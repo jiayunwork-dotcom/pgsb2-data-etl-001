@@ -4,6 +4,16 @@ Changes
 Version 1.7.32
 --------------
 
+* Added an optional streaming mode to ``fromjson()`` via ``streaming=True``
+  for UTF-8 files whose top level value is a JSON array of objects. Records
+  are read incrementally from local, compressed and custom binary sources
+  without seeking or unbounded reads, so the first row is available before
+  the whole document is loaded and memory stays bounded by ``chunksize``,
+  ``max_record_chars`` and ``sample`` rather than file size. The new
+  ``chunksize`` and ``max_record_chars`` options tune the read size and the
+  per-object character limit; the default non-streaming array and JSON
+  lines behaviour is unchanged.
+
 * Use PETL's mixed-type ordering for variable names discovered by
   ``recast()``, allowing tables with mixed-type headers to be melted and
   recast without a comparison error.

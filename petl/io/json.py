@@ -12,9 +12,20 @@ from tempfile import NamedTemporaryFile
 
 from petl.compat import PY2
 from petl.compat import pickle
+from petl.errors import ArgumentError
+from petl.io.json_streaming import decode_streaming_records
 from petl.io.sources import read_source_from_arg, write_source_from_arg
 # internal dependencies
 from petl.util.base import data, Table, dicts as _dicts
+
+
+def _positive_int_option(name, value):
+    # bool is a subclass of int; reject it explicitly so True is not a
+    # silently accepted "size"
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ArgumentError(
+            '%s must be a positive integer, found %r' % (name, value))
+    return value
 
 
 def fromjson(source, *args, **kwargs):
@@ -89,6 +100,47 @@ def fromjson(source, *args, **kwargs):
     via :func:`json.load` and select the array to treat as the data, see also
     :func:`petl.io.json.fromdicts`.
 
+    Set `streaming` to `True` to read a top level array incrementally
+    instead of loading the whole document into memory before the first row.
+    Streaming mode accepts UTF-8 encoded files whose top level value is a
+    JSON array of JSON objects; it works with local files, compressed files
+    and any Source whose ``open('rb')`` returns a binary context manager.
+    The stream does not need to be seekable and a single ``read(n)`` may
+    return fewer than ``n`` bytes.
+
+    `chunksize` is the maximum number of bytes requested from the binary
+    source per read (default 65536) and `max_record_chars` caps the number
+    of decoded text characters allowed for a single object, counted from
+    its opening to closing brace and including internal whitespace but not
+    the whitespace between objects (default 8388608); an object exactly at
+    the limit is accepted. Memory use is bounded by `chunksize`,
+    `max_record_chars` and `sample`, not by the total file size.
+
+    Streaming mode supports the standard decoder options `parse_float`,
+    `parse_int`, `parse_constant`, `object_hook`, `object_pairs_hook` and
+    `strict`; they apply to header sampling as well as data rows and each
+    sampled object is decoded only once. A record (including the result of
+    an `object_hook` or `object_pairs_hook`) must still be a dict. Custom
+    `cls` decoders and extra positional arguments are rejected with an
+    :class:`petl.errors.ArgumentError` rather than silently ignored.
+    `streaming=True` cannot be combined with `lines=True`.
+
+        >>> import petl as etl
+        >>> big = '[{"foo": "a"}, {"foo": "b"}]'
+        >>> with open('example.file5.json', 'w') as f:
+        ...     f.write(big)
+        ...
+        28
+        >>> table3 = etl.fromjson('example.file5.json', streaming=True)
+        >>> list(table3)
+        [('foo',), ('a',), ('b',)]
+
+    Syntax errors are raised as :class:`json.JSONDecodeError` with line and
+    column positions based on the original input text, UTF-8 decoding
+    failures remain :class:`UnicodeDecodeError`, and record type and length
+    violations raise :class:`petl.errors.ArgumentError`. Results already
+    yielded before a malformed suffix are not withdrawn.
+
     .. versionchanged:: 1.1.0
 
     If no `header` is specified, fields will be discovered by sampling keys
@@ -115,12 +167,36 @@ class JsonView(Table):
         self._header = kwargs.pop('header', None)
         self.sample = kwargs.pop('sample', 1000)
         self.lines = kwargs.pop('lines', False)
+        self.streaming = kwargs.pop('streaming', False)
+        self.chunksize = _positive_int_option(
+            'chunksize', kwargs.pop('chunksize', 65536))
+        self.max_record_chars = _positive_int_option(
+            'max_record_chars',
+            kwargs.pop('max_record_chars', 8388608))
+        # these are validated before the source is ever opened, so an
+        # unsupported combination fails at view construction time
+        if self.streaming and self.lines:
+            raise ArgumentError(
+                'streaming=True cannot be combined with lines=True; JSON '
+                'lines are already read incrementally')
+        if self.streaming:
+            if args:
+                raise ArgumentError(
+                    'streaming mode does not accept extra positional '
+                    'arguments; use decoder keyword arguments instead')
+            if 'cls' in kwargs:
+                raise ArgumentError(
+                    'streaming mode does not support a custom decoder cls')
         self.args = args
         self.kwargs = kwargs
 
     def __iter__(self):
         if self._header is not None:
             self._header = tuple(self._header)
+        if self.streaming:
+            for row in self._iter_streaming():
+                yield row
+            return
         with self.source.open('rb') as f:
             if not PY2:
                 # wrap buffer for text IO
@@ -139,6 +215,42 @@ class JsonView(Table):
             finally:
                 if not PY2:
                     f.detach()
+
+    def _iter_streaming(self):
+        # Mirror iterdicts(): an explicit header (even an empty one) is
+        # consumed once here and reused; otherwise sample the leading
+        # objects for keys while keeping the decoded objects as rows so
+        # nothing is decoded twice.
+        if self._header is None:
+            if self.sample < 0:
+                raise ValueError('sample must be non-negative')
+            header = None
+            sampled = []
+        else:
+            header = tuple(self._header)
+            sampled = None
+            yield header
+
+        with self.source.open('rb') as f:
+            records = decode_streaming_records(
+                f, self.chunksize, self.max_record_chars, self.kwargs)
+            if header is None:
+                discovered = []
+                for record, _, _ in islice(records, self.sample):
+                    sampled.append(record)
+                    for key in record.keys():
+                        if key not in discovered:
+                            discovered.append(key)
+                header = tuple(discovered)
+                yield header
+                iterator = chain(sampled,
+                                 (record for record, _, _ in records))
+            else:
+                iterator = (record for record, _, _ in records)
+
+            for record in iterator:
+                yield tuple(record.get(field, self.missing)
+                            for field in header)
 
 
 def fromdicts(dicts, header=None, sample=1000, missing=None):
