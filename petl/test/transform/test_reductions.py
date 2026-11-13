@@ -1,17 +1,23 @@
 from __future__ import absolute_import, print_function, division
 
 
+import gc
 import operator
+import os
+import random
+import shutil
+import tempfile
 
 import pytest
 
 
 from collections import OrderedDict
 from petl.test.helpers import ieq
-from petl.errors import FieldSelectionError
+from petl.errors import ArgumentError, FieldSelectionError
+from petl.comparison import Comparable
 from petl.util import strjoin
 from petl.transform.reductions import rowreduce, aggregate, \
-    mergeduplicates, merge, Conflict, fold
+    mergeduplicates, merge, Conflict, fold, rollingaggregate
 
 
 def test_rowreduce():
@@ -728,3 +734,769 @@ def test_fold():
     expect = (('key', 'value'), (1, 8), (2, 12))
     ieq(expect, t2)
     ieq(expect, t2)
+
+
+# ---------------------------------------------------------------------------
+# rollingaggregate
+# ---------------------------------------------------------------------------
+
+
+def _rolling_indices(hdr, time, by):
+    tidx = hdr.index(time)
+    if by is None:
+        bidx = ()
+    elif isinstance(by, str):
+        bidx = (hdr.index(by),)
+    else:
+        bidx = tuple(hdr.index(b) for b in by)
+    return tidx, bidx
+
+
+def _rolling_sorted_rows(rows, hdr, time, by):
+    """Stable sort of the data rows by (by..., time) using petl's table
+    sort semantics, mirroring what the default path does internally."""
+    tidx, bidx = _rolling_indices(hdr, time, by)
+
+    def key(row):
+        return Comparable(tuple(row[i] for i in bidx) + (row[tidx],))
+
+    return sorted(rows, key=key)
+
+
+def _naive_rollingaggregate(table, time, value, width, by=None,
+                            prefix='window_'):
+    """Independent naive reference implementation. Recomputes the window
+    from scratch for every row, O(W) per row."""
+    table = [tuple(row) for row in table]
+    hdr, rows = table[0], table[1:]
+    tidx, bidx = _rolling_indices(hdr, time, by)
+    vidx = hdr.index(value)
+    outhdr = hdr + (prefix + 'count', prefix + 'sum', prefix + 'min',
+                    prefix + 'max')
+    out = [outhdr]
+    window = []
+    current = None
+    started = False
+    for row in _rolling_sorted_rows(rows, hdr, time, by):
+        if bidx:
+            gkey = Comparable(tuple(row[i] for i in bidx))
+        else:
+            gkey = None
+        if not started or not (gkey == current):
+            window = []
+            current = gkey
+            started = True
+        t = row[tidx]
+        # window holds rows of this group with time strictly greater than
+        # t - width, up to and including the current row
+        window = [w for w in window if w[tidx] > t - width]
+        window.append(row)
+        vals = [w[vidx] for w in window if w[vidx] is not None]
+        out.append(row + (len(window),
+                          sum(vals),
+                          min(vals) if vals else None,
+                          max(vals) if vals else None))
+    return out
+
+
+def test_rollingaggregate_handchecked():
+    # hand-checked example, independent of the naive reference
+    table = [['id', 'time', 'value'],
+             ['a', 1, 10],
+             ['a', 2, 20],
+             ['b', 3, 5],
+             ['a', 4, None],
+             ['a', 5, 7]]
+    expect = (('id', 'time', 'value', 'window_count', 'window_sum',
+               'window_min', 'window_max'),
+              ('a', 1, 10, 1, 10, 10, 10),
+              ('a', 2, 20, 2, 30, 10, 20),
+              ('a', 4, None, 2, 20, 20, 20),
+              ('a', 5, 7, 2, 7, 7, 7),
+              ('b', 3, 5, 1, 5, 5, 5))
+    ieq(expect, rollingaggregate(table, 'time', 'value', 3, by='id'))
+    # same result via the presorted path
+    sorted_table = [table[0]] + _rolling_sorted_rows(table[1:], table[0],
+                                                     'time', 'id')
+    ieq(expect, rollingaggregate(sorted_table, 'time', 'value', 3, by='id',
+                                 presorted=True))
+    # without grouping the whole table is one window, sorted by time only
+    expect2 = (('id', 'time', 'value', 'window_count', 'window_sum',
+                'window_min', 'window_max'),
+               ('a', 1, 10, 1, 10, 10, 10),
+               ('a', 2, 20, 2, 30, 10, 20),
+               ('b', 3, 5, 2, 25, 5, 20),
+               ('a', 4, None, 2, 5, 5, 5),
+               ('a', 5, 7, 2, 7, 7, 7))
+    ieq(expect2, rollingaggregate(table, 'time', 'value', 2))
+
+
+def test_rollingaggregate_window_left_boundary():
+    # a record exactly at time - width is *not* in the window
+    table = [('t', 'v')] + [(i, i) for i in range(6)]
+    expect = [('t', 'v', 'window_count', 'window_sum', 'window_min',
+               'window_max'),
+              (0, 0, 1, 0, 0, 0),
+              (1, 1, 2, 1, 0, 1),
+              (2, 2, 3, 3, 0, 2),
+              (3, 3, 3, 6, 1, 3),   # time 0 is exactly at 3 - 3, excluded
+              (4, 4, 3, 9, 2, 4),
+              (5, 5, 3, 12, 3, 5)]
+    ieq(expect, rollingaggregate(table, 't', 'v', 3))
+    ieq(expect, rollingaggregate(table, 't', 'v', 3, presorted=True))
+
+
+def test_rollingaggregate_negative_times():
+    table = [('t', 'v'),
+             (-4, 3),
+             (-10, 1),
+             (0, 4),
+             (-5, 2)]
+    expect = [('t', 'v', 'window_count', 'window_sum', 'window_min',
+               'window_max'),
+              (-10, 1, 1, 1, 1, 1),
+              (-5, 2, 1, 2, 2, 2),    # -10 is exactly at -5 - 5, excluded
+              (-4, 3, 2, 5, 2, 3),
+              (0, 4, 2, 7, 3, 4)]     # -5 is exactly at 0 - 5, excluded
+    ieq(expect, rollingaggregate(table, 't', 'v', 5))
+    sorted_table = [table[0]] + _rolling_sorted_rows(table[1:], table[0],
+                                                     't', None)
+    ieq(expect, rollingaggregate(sorted_table, 't', 'v', 5, presorted=True))
+
+
+def test_rollingaggregate_big_integers_exact():
+    big = 2 ** 70 + 12345
+    table = [('t', 'v'),
+             (1, big),
+             (2, big + 1),
+             (3, -big),
+             (4, None)]
+    rows = list(rollingaggregate(table, 't', 'v', 10))
+    # sums are exact integers, no float rounding of large integers
+    assert rows[1][3] == big and isinstance(rows[1][3], int)
+    assert rows[2][3] == 2 * big + 1 and isinstance(rows[2][3], int)
+    assert rows[3][3] == big + 1 and isinstance(rows[3][3], int)
+    assert rows[3][4] == -big and rows[3][5] == big + 1
+    assert rows[4][2] == 4  # count includes the None-valued row
+    assert rows[4][3] == big + 1  # None contributes nothing to the sum
+    ieq(_naive_rollingaggregate(table, 't', 'v', 10),
+        rollingaggregate(table, 't', 'v', 10))
+
+
+def test_rollingaggregate_same_time_stable_prefix():
+    # rows with equal times advance one at a time, in input order
+    table = [('g', 't', 'v', 'tag'),
+             ('a', 5, 1, 'first'),
+             ('a', 5, 2, 'second'),
+             ('a', 5, None, 'third'),
+             ('a', 5, 4, 'fourth')]
+    expect = [('g', 't', 'v', 'tag', 'window_count', 'window_sum',
+               'window_min', 'window_max'),
+              ('a', 5, 1, 'first', 1, 1, 1, 1),
+              ('a', 5, 2, 'second', 2, 3, 1, 2),
+              ('a', 5, None, 'third', 3, 3, 1, 2),
+              ('a', 5, 4, 'fourth', 4, 7, 1, 4)]
+    ieq(expect, rollingaggregate(table, 't', 'v', 3, by='g'))
+    ieq(expect, rollingaggregate(table, 't', 'v', 3, by='g',
+                                 presorted=True))
+
+
+def test_rollingaggregate_duplicate_and_expiring_extremes():
+    table = [('t', 'v'),
+             (1, 5),
+             (2, 5),
+             (3, 1),
+             (4, 2),
+             (5, 3)]
+    expect = [('t', 'v', 'window_count', 'window_sum', 'window_min',
+               'window_max'),
+              (1, 5, 1, 5, 5, 5),
+              (2, 5, 2, 10, 5, 5),
+              (3, 1, 2, 6, 1, 5),   # first 5 expired, duplicate remains
+              (4, 2, 2, 3, 1, 2),   # both 5s expired, max drops
+              (5, 3, 2, 5, 2, 3)]
+    ieq(expect, rollingaggregate(table, 't', 'v', 2))
+    ieq(expect, rollingaggregate(table, 't', 'v', 2, presorted=True))
+
+
+def test_rollingaggregate_group_switch_no_leak():
+    table = [('g', 't', 'v'),
+             ('a', 1, 10),
+             ('b', 1, 20),
+             ('a', 2, 30),
+             ('b', 2, 40)]
+    expect = [('g', 't', 'v', 'window_count', 'window_sum', 'window_min',
+               'window_max'),
+              ('a', 1, 10, 1, 10, 10, 10),
+              ('a', 2, 30, 2, 40, 10, 30),
+              ('b', 1, 20, 1, 20, 20, 20),  # group a's window must not leak
+              ('b', 2, 40, 2, 60, 20, 40)]
+    ieq(expect, rollingaggregate(table, 't', 'v', 3, by='g'))
+    sorted_table = [table[0]] + _rolling_sorted_rows(table[1:], table[0],
+                                                     't', 'g')
+    ieq(expect, rollingaggregate(sorted_table, 't', 'v', 3, by='g',
+                                 presorted=True))
+
+
+def test_rollingaggregate_none_group_and_values():
+    table = [('g', 't', 'v'),
+             (None, 1, None),
+             (None, 2, None),
+             ('a', 1, 5),
+             (None, 3, 7)]
+    expect = [('g', 't', 'v', 'window_count', 'window_sum', 'window_min',
+               'window_max'),
+              (None, 1, None, 1, 0, None, None),
+              (None, 2, None, 2, 0, None, None),
+              (None, 3, 7, 3, 7, 7, 7),
+              ('a', 1, 5, 1, 5, 5, 5)]
+    ieq(expect, rollingaggregate(table, 't', 'v', 5, by='g'))
+    sorted_table = [table[0]] + _rolling_sorted_rows(table[1:], table[0],
+                                                     't', 'g')
+    ieq(expect, rollingaggregate(sorted_table, 't', 'v', 5, by='g',
+                                 presorted=True))
+
+
+def test_rollingaggregate_compound_by():
+    table = [('g1', 'g2', 't', 'v'),
+             ('a', 'x', 1, 1),
+             ('a', 'y', 1, 10),
+             ('a', 'x', 2, 2),
+             ('a', 'y', 2, 20),
+             ('b', 'x', 1, 100)]
+    expect = _naive_rollingaggregate(table, 't', 'v', 5, by=('g1', 'g2'))
+    # spot-check the grouping: each (g1, g2) pair gets its own window
+    assert expect[1] == ('a', 'x', 1, 1, 1, 1, 1, 1)
+    assert expect[2] == ('a', 'x', 2, 2, 2, 3, 1, 2)
+    assert expect[3] == ('a', 'y', 1, 10, 1, 10, 10, 10)
+    assert expect[4] == ('a', 'y', 2, 20, 2, 30, 10, 20)
+    assert expect[5] == ('b', 'x', 1, 100, 1, 100, 100, 100)
+    ieq(expect, rollingaggregate(table, 't', 'v', 5, by=('g1', 'g2')))
+    ieq(expect, rollingaggregate(table, 't', 'v', 5, by=['g1', 'g2'],
+                                 buffersize=2))
+    sorted_table = [table[0]] + _rolling_sorted_rows(table[1:], table[0],
+                                                     't', ('g1', 'g2'))
+    ieq(expect, rollingaggregate(sorted_table, 't', 'v', 5, by=('g1', 'g2'),
+                                 presorted=True))
+
+
+def test_rollingaggregate_custom_prefix():
+    table = [('t', 'v'), (1, 5), (2, 7)]
+    expect = [('t', 'v', 'r_count', 'r_sum', 'r_min', 'r_max'),
+              (1, 5, 1, 5, 5, 5),
+              (2, 7, 2, 12, 5, 7)]
+    ieq(expect, rollingaggregate(table, 't', 'v', 2, prefix='r_'))
+
+
+def test_rollingaggregate_empty_and_header_only():
+    # header only -> only the output header is produced
+    view = rollingaggregate([('g', 't', 'v')], 't', 'v', 3, by='g')
+    assert list(view) == [('g', 't', 'v', 'window_count', 'window_sum',
+                           'window_min', 'window_max')]
+    view = rollingaggregate([('g', 't', 'v')], 't', 'v', 3, by='g',
+                            presorted=True)
+    assert list(view) == [('g', 't', 'v', 'window_count', 'window_sum',
+                           'window_min', 'window_max')]
+    # no header row at all -> error
+    pytest.raises(ArgumentError, list, rollingaggregate([], 't', 'v', 3))
+    pytest.raises(ArgumentError, list,
+                  rollingaggregate([], 't', 'v', 3, presorted=True))
+
+
+def test_rollingaggregate_randomised_matches_naive():
+    rng = random.Random(20261112)
+    hdr = ('g1', 'g2', 't', 'v', 'tag')
+    for _ in range(30):
+        n = rng.randint(0, 60)
+        rows = []
+        for i in range(n):
+            g1 = rng.choice([None, 'a', 'b', 'c'])
+            g2 = rng.choice([None, 'x', 'y'])
+            t = rng.randint(-15, 15)
+            r = rng.random()
+            if r < 0.25:
+                v = None
+            elif r < 0.35:
+                v = rng.choice([2 ** 70, -(2 ** 70), 0])
+            else:
+                v = rng.randint(-100, 100)
+            rows.append((g1, g2, t, v, 'row%d' % i))
+        width = rng.randint(1, 12)
+        by = rng.choice([None, 'g1', 'g2', ('g1', 'g2'), ['g1', 'g2']])
+        table = [hdr] + rows
+        expect = _naive_rollingaggregate(table, 't', 'v', width, by=by)
+        # default path, with a small buffer to force chunked sorting
+        ieq(expect, rollingaggregate(table, 't', 'v', width, by=by,
+                                     buffersize=5))
+        # presorted path over the stably sorted input
+        sorted_table = [hdr] + _rolling_sorted_rows(rows, hdr, 't', by)
+        ieq(expect, rollingaggregate(sorted_table, 't', 'v', width, by=by,
+                                     presorted=True))
+
+
+def test_rollingaggregate_argument_validation():
+    table = [('g', 't', 'v')]
+    # time and value must be single field names
+    pytest.raises(ArgumentError, rollingaggregate, table, 0, 'v', 3)
+    pytest.raises(ArgumentError, rollingaggregate, table, ['t'], 'v', 3)
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 1, 3)
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', ['v'], 3)
+    # time and value must not overlap each other or by
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 't', 3)
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 'v', 3,
+                  by='t')
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 'v', 3,
+                  by='v')
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 'v', 3,
+                  by=('g', 't'))
+    # by must be None, a field name, or a non-empty sequence of field names
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 'v', 3,
+                  by=[])
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 'v', 3,
+                  by=())
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 'v', 3,
+                  by=5)
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 'v', 3,
+                  by=('g', 5))
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 'v', 3,
+                  by=('g', 'g'))
+    # width must be a positive integer and not a bool
+    for badwidth in (0, -1, -100, True, False, 2.5, '3', None):
+        pytest.raises(ArgumentError, rollingaggregate, table, 't', 'v',
+                      badwidth)
+    # prefix must be a string
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 'v', 3,
+                  prefix=5)
+    pytest.raises(ArgumentError, rollingaggregate, table, 't', 'v', 3,
+                  prefix=None)
+    # valid forms construct without touching the source
+    rollingaggregate(table, 't', 'v', 3)
+    rollingaggregate(table, 't', 'v', 3, by='g')
+    rollingaggregate(table, 't', 'v', 3, by=['g'])
+    rollingaggregate(table, 't', 'v', 1, prefix='w_')
+
+
+def test_rollingaggregate_validation_is_lazy():
+    # missing field: construction and iter() are fine, error on consumption
+    view = rollingaggregate([('t', 'v')], 'missing', 'v', 3)
+    it = iter(view)
+    pytest.raises(FieldSelectionError, next, it)
+
+
+def test_rollingaggregate_field_and_header_errors():
+    for presorted in (False, True):
+        kwargs = {'presorted': presorted}
+        # missing fields -> FieldSelectionError when the header is consumed
+        pytest.raises(FieldSelectionError, list,
+                      rollingaggregate([('t', 'v')], 'missing', 'v', 3,
+                                       **kwargs))
+        pytest.raises(FieldSelectionError, list,
+                      rollingaggregate([('t', 'v')], 't', 'missing', 3,
+                                       **kwargs))
+        pytest.raises(FieldSelectionError, list,
+                      rollingaggregate([('t', 'v')], 't', 'v', 3,
+                                       by='missing', **kwargs))
+        # non-string and duplicate header field names
+        pytest.raises(ArgumentError, list,
+                      rollingaggregate([(1, 't', 'v')], 't', 'v', 3,
+                                       **kwargs))
+        pytest.raises(ArgumentError, list,
+                      rollingaggregate([('t', 'v', 'v')], 't', 'v', 3,
+                                       **kwargs))
+        # appended columns must not clash with the existing header
+        pytest.raises(ArgumentError, list,
+                      rollingaggregate([('t', 'v', 'window_sum')], 't', 'v',
+                                       3, **kwargs))
+        pytest.raises(ArgumentError, list,
+                      rollingaggregate([('t', 'v', 'w_max')], 't', 'v', 3,
+                                       prefix='w_', **kwargs))
+
+
+@pytest.mark.parametrize('badtime', [True, False, 1.5, '10', None])
+def test_rollingaggregate_invalid_time(badtime):
+    table = [('t', 'v'), (1, 10), (badtime, 20), (3, 30)]
+    view = rollingaggregate(table, 't', 'v', 3, presorted=True)
+    it = iter(view)
+    next(it)  # header
+    assert next(it)[:2] == (1, 10)  # row 1 is fine
+    with pytest.raises(ArgumentError) as excinfo:
+        next(it)
+    assert 'row 2' in str(excinfo.value)
+
+
+@pytest.mark.parametrize('badvalue', [True, False, 1.5, '10'])
+def test_rollingaggregate_invalid_value(badvalue):
+    table = [('t', 'v'), (1, 10), (2, badvalue), (3, 30)]
+    view = rollingaggregate(table, 't', 'v', 3, presorted=True)
+    it = iter(view)
+    next(it)  # header
+    assert next(it)[:2] == (1, 10)  # row 1 is fine
+    with pytest.raises(ArgumentError) as excinfo:
+        next(it)
+    assert 'row 2' in str(excinfo.value)
+
+
+def test_rollingaggregate_row_width_errors():
+    # short row
+    table = [('t', 'v'), (1, 10), (2,), (3, 30)]
+    view = rollingaggregate(table, 't', 'v', 3, presorted=True)
+    it = iter(view)
+    next(it)
+    next(it)
+    with pytest.raises(ArgumentError) as excinfo:
+        next(it)
+    assert 'row 2' in str(excinfo.value)
+    # long row
+    table = [('t', 'v'), (1, 10, 99)]
+    with pytest.raises(ArgumentError) as excinfo:
+        list(rollingaggregate(table, 't', 'v', 3, presorted=True))
+    assert 'row 1' in str(excinfo.value)
+
+
+def test_rollingaggregate_error_row_numbers_are_original():
+    # unsorted input: the bad row is the 3rd row of the original input,
+    # and the error must point there even though sorting moves it around
+    table = [('t', 'v'),
+             (5, 1),
+             (1, 2),
+             (3, 'bad'),
+             (2, 4)]
+    view = rollingaggregate(table, 't', 'v', 3, buffersize=2)
+    with pytest.raises(ArgumentError) as excinfo:
+        list(view)
+    assert 'row 3' in str(excinfo.value)
+
+
+def test_rollingaggregate_presorted_order_regression():
+    table = [('g', 't', 'v'),
+             ('a', 1, 10),
+             ('a', 3, 30),
+             ('a', 2, 20)]  # time goes backwards within the group
+    view = rollingaggregate(table, 't', 'v', 3, by='g', presorted=True)
+    it = iter(view)
+    next(it)
+    next(it)
+    next(it)  # rows 1 and 2 are produced before the bad row is reached
+    with pytest.raises(ArgumentError) as excinfo:
+        next(it)
+    assert 'row 3' in str(excinfo.value)
+    # group regression
+    table = [('g', 't', 'v'), ('b', 1, 1), ('a', 1, 2)]
+    with pytest.raises(ArgumentError) as excinfo:
+        list(rollingaggregate(table, 't', 'v', 3, by='g', presorted=True))
+    assert 'row 2' in str(excinfo.value)
+    # equal keys are fine
+    table = [('g', 't', 'v'), ('a', 1, 1), ('a', 1, 2), ('a', 2, 3)]
+    assert len(list(rollingaggregate(table, 't', 'v', 3, by='g',
+                                     presorted=True))) == 4
+    # and the default path sorts, so it accepts the same input
+    table = [('g', 't', 'v'), ('b', 1, 1), ('a', 1, 2)]
+    assert len(list(rollingaggregate(table, 't', 'v', 3, by='g'))) == 3
+
+
+class _RollingProbeSource(object):
+    """A source that records how many iterators were requested from it,
+    how many data rows were actually pulled, and how many iterators were
+    closed. Can be made to fail at a given (1-based) data row."""
+
+    def __init__(self, table, failat=None):
+        self.table = [tuple(row) for row in table]
+        self.failat = failat
+        self.iterators = 0
+        self.rows_consumed = 0
+        self.closed = 0
+
+    def __iter__(self):
+        self.iterators += 1
+        return self._gen()
+
+    def _gen(self):
+        try:
+            yield self.table[0]
+            for i, row in enumerate(self.table[1:], start=1):
+                if self.failat is not None and i == self.failat:
+                    raise RuntimeError('probe failure at row %d' % i)
+                self.rows_consumed += 1
+                yield row
+        finally:
+            self.closed += 1
+
+
+def test_rollingaggregate_presorted_reads_rows_on_demand():
+    hdr = ('g', 't', 'v')
+    rows = [('a', i, i * 10) for i in range(1, 11)]
+    rows += [('b', i, i) for i in range(1, 6)]
+    probe = _RollingProbeSource([hdr] + rows)
+    view = rollingaggregate(probe, 't', 'v', 3, by='g', presorted=True)
+    assert probe.iterators == 0  # creating the view reads nothing
+    it = iter(view)
+    assert probe.iterators == 0  # iter(view) reads nothing either
+    next(it)  # the header
+    assert probe.iterators == 1  # exactly one iterator requested
+    assert probe.rows_consumed == 0
+    for k in range(1, len(rows) + 1):
+        next(it)
+        # each output row is available after reading exactly its own input
+        # row: no look-ahead into future rows, groups, or the whole input
+        assert probe.rows_consumed == k
+    pytest.raises(StopIteration, next, it)
+    assert probe.closed == 1  # exhausted iterator was released
+
+
+def test_rollingaggregate_default_path_consumption():
+    hdr = ('t', 'v')
+    rows = [(i, i) for i in range(10)]
+    probe = _RollingProbeSource([hdr] + rows)
+    view = rollingaggregate(probe, 't', 'v', 3)
+    assert probe.iterators == 0
+    it = iter(view)
+    assert probe.iterators == 0
+    next(it)  # the header alone does not consume any data row
+    assert probe.iterators == 1
+    assert probe.rows_consumed == 0
+    next(it)  # sorting consumes the whole input before the first data row
+    assert probe.rows_consumed == len(rows)
+    list(it)
+    assert probe.closed == 1
+
+
+def test_rollingaggregate_close_releases_source():
+    table = [('t', 'v')] + [(i, i) for i in range(10)]
+    # presorted: rows are pulled on demand, so closing early must release
+    # the source and stop any further reading
+    probe = _RollingProbeSource(table)
+    view = rollingaggregate(probe, 't', 'v', 3, presorted=True)
+    it = iter(view)
+    next(it)
+    next(it)
+    assert probe.closed == 0
+    assert probe.rows_consumed == 1
+    it.close()
+    assert probe.closed == 1
+    assert probe.rows_consumed == 1
+    pytest.raises(StopIteration, next, it)
+    assert probe.rows_consumed == 1
+    # default path: the sort has already consumed (and so released) the
+    # source by the time the first data row appears; closing must be
+    # harmless and read nothing more
+    probe = _RollingProbeSource(table)
+    view = rollingaggregate(probe, 't', 'v', 3, buffersize=3)
+    it = iter(view)
+    next(it)
+    next(it)
+    assert probe.rows_consumed == 10
+    assert probe.closed == 1
+    it.close()
+    assert probe.closed == 1
+    assert probe.rows_consumed == 10
+
+
+def test_rollingaggregate_source_exception_propagates_and_cleans_up():
+    table = [('t', 'v')] + [(i, i) for i in range(10)]
+    for presorted in (True, False):
+        probe = _RollingProbeSource(table, failat=4)
+        view = rollingaggregate(probe, 't', 'v', 3, presorted=presorted,
+                                buffersize=3)
+        with pytest.raises(RuntimeError) as excinfo:
+            list(view)
+        # the source exception propagates as-is
+        assert 'probe failure at row 4' in str(excinfo.value)
+        assert probe.closed == 1
+
+
+def test_rollingaggregate_cleanup_does_not_mask_source_exception():
+    class BadCloseIterator(object):
+        def __init__(self, table, failat):
+            self.rows = iter(table)
+            self.failat = failat
+            self.pos = 0
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.pos += 1
+            if self.pos == self.failat:
+                raise ValueError('original failure')
+            return next(self.rows)
+
+        def close(self):
+            self.closed = True
+            raise RuntimeError('close failure')
+
+    class BadCloseSource(object):
+        def __init__(self, table, failat):
+            self.table = table
+            self.failat = failat
+            self.iterator = None
+
+        def __iter__(self):
+            self.iterator = BadCloseIterator(self.table, self.failat)
+            return self.iterator
+
+    table = [('t', 'v')] + [(i, i) for i in range(10)]
+    source = BadCloseSource(table, failat=3)
+    view = rollingaggregate(source, 't', 'v', 3, presorted=True)
+    with pytest.raises(ValueError) as excinfo:
+        list(view)
+    # the original exception wins over the cleanup failure
+    assert 'original failure' in str(excinfo.value)
+    assert source.iterator.closed
+
+
+def test_rollingaggregate_tempfiles_cleaned_up():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        table = [('g', 't', 'v')] + [('a', i, i) for i in range(20)]
+        # early close: chunk files must be removed
+        view = rollingaggregate(table, 't', 'v', 3, buffersize=2,
+                                tempdir=tmpdir)
+        it = iter(view)
+        next(it)
+        next(it)
+        assert os.listdir(tmpdir) != []  # sanity: chunks were spilled
+        it.close()
+        gc.collect()
+        assert os.listdir(tmpdir) == []
+        # full exhaustion: same
+        view = rollingaggregate(table, 't', 'v', 3, buffersize=2,
+                                tempdir=tmpdir)
+        list(view)
+        gc.collect()
+        assert os.listdir(tmpdir) == []
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_rollingaggregate_repeated_iteration():
+    table = [['g', 't', 'v'], ['a', 2, 20], ['a', 1, 10]]
+    view = rollingaggregate(table, 't', 'v', 3, by='g')
+    first = list(view)
+    assert first == _naive_rollingaggregate(table, 't', 'v', 3, by='g')
+    # a second pass over a repeatable source gives the same result and
+    # does not reuse cached window state
+    assert list(view) == first
+    # and it reflects the current state of the source
+    table.append(['a', 3, 30])
+    expect = _naive_rollingaggregate(table, 't', 'v', 3, by='g')
+    assert list(view) == expect
+    assert list(view) != first
+    # independent iterators have independent window state
+    it1, it2 = iter(view), iter(view)
+    for expected_row in expect:
+        assert next(it1) == expected_row
+        assert next(it2) == expected_row
+
+
+def test_rollingaggregate_fluent_and_exported():
+    import petl as etl
+    table = [('t', 'v'), (1, 10), (2, 20)]
+    expect = _naive_rollingaggregate(table, 't', 'v', 2)
+    ieq(expect, etl.rollingaggregate(table, 't', 'v', 2))
+    ieq(expect, etl.wrap(table).rollingaggregate('t', 'v', 2))
+    # the result chains back into the fluent pipeline
+    chained = etl.wrap(table).rollingaggregate('t', 'v', 2) \
+        .cut('t', 'window_sum')
+    ieq((('t', 'window_sum'), (1, 10), (2, 30)), chained)
+
+
+class _CountingInt(int):
+    """An int that counts how many times it is compared."""
+
+    ncomparisons = 0
+
+    def __lt__(self, other):
+        _CountingInt.ncomparisons += 1
+        return int.__lt__(self, other)
+
+    def __le__(self, other):
+        _CountingInt.ncomparisons += 1
+        return int.__le__(self, other)
+
+    def __gt__(self, other):
+        _CountingInt.ncomparisons += 1
+        return int.__gt__(self, other)
+
+    def __ge__(self, other):
+        _CountingInt.ncomparisons += 1
+        return int.__ge__(self, other)
+
+
+@pytest.mark.parametrize('width', [500, 10 ** 9])
+@pytest.mark.parametrize('shape', ['random', 'increasing', 'decreasing',
+                                   'constant'])
+def test_rollingaggregate_workload_is_linear_in_rows(width, shape):
+    # For N rows and peak window W, maintaining the statistics must cost
+    # O(N) amortised (better than the allowed O(N log(W+1))): each value
+    # enters and leaves each monotone deque at most once. An implementation
+    # that rescans the window for every row would need ~N*W comparisons.
+    n = 4000
+    rng = random.Random(7)
+    rows = []
+    for i in range(n):
+        if shape == 'random':
+            v = rng.randint(0, 10 ** 6)
+        elif shape == 'increasing':
+            v = i
+        elif shape == 'decreasing':
+            v = n - i
+        else:
+            v = 42
+        rows.append((i, _CountingInt(v)))
+    table = [('t', 'v')] + rows
+    _CountingInt.ncomparisons = 0
+    result = list(rollingaggregate(table, 't', 'v', width, presorted=True))
+    ncomps = _CountingInt.ncomparisons
+    assert len(result) == n + 1
+    # spot-check correctness of one row deep inside a large window;
+    # row i has time i, so its window covers rows lo..k (times > k - width)
+    k = 1234
+    lo = max(0, k - width + 1)
+    vals = [int(rows[i][1]) for i in range(lo, k + 1)]
+    expect_row = (k, rows[k][1], len(vals), sum(vals), min(vals),
+                  max(vals))
+    assert result[k + 1] == expect_row
+    # amortised O(1) per row: a generous bound of 10 comparisons per row;
+    # a per-row window rescan would need ~(n - width) * (width - 1) * 2
+    # comparisons for width=500, i.e. millions
+    assert 0 < ncomps <= 10 * n
+
+
+def test_rollingaggregate_drops_expired_history():
+    # values are tracked for liveness; once a row has expired from every
+    # window its value objects must be released, so the retained set is
+    # bounded by the live window, not by the history seen so far
+    n = 3000
+    width = 10
+
+    class TrackedInt(int):
+        alive = 0
+
+        def __new__(cls, x):
+            TrackedInt.alive += 1
+            return int.__new__(cls, x)
+
+        def __del__(self):
+            TrackedInt.alive -= 1
+
+    def source():
+        yield ('t', 'v')
+        for i in range(n):
+            yield (i, TrackedInt(i))
+
+    view = rollingaggregate(source(), 't', 'v', width, presorted=True)
+    it = iter(view)
+    next(it)  # header
+    halfway = n // 2
+    for _ in range(halfway):
+        next(it)
+    gc.collect()
+    # only the current window (plus the row in flight) may still be alive;
+    # an implementation keeping expired history would still hold ~halfway
+    assert 0 < TrackedInt.alive <= 4 * width
+    for row in it:
+        pass
+    del row, it
+    gc.collect()
+    assert TrackedInt.alive <= 4 * width

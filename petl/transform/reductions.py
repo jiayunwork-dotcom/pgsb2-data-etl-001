@@ -3,10 +3,11 @@ from __future__ import absolute_import, print_function, division
 
 import itertools
 import operator
-from collections import OrderedDict
-from petl.compat import next, string_types, reduce, text_type
+from collections import OrderedDict, deque
+from petl.compat import next, string_types, integer_types, reduce, text_type
 
 
+from petl.comparison import comparable_itemgetter
 from petl.errors import ArgumentError, FieldSelectionError
 from petl.util.base import Table, iterpeek, rowgroupby, asindices
 from petl.util.base import values, records
@@ -768,3 +769,369 @@ def iterfold(table, key, f, value):
     yield ('key', 'value')
     for k, grp in rowgroupby(table, key, value):
         yield k, reduce(f, grp)
+
+
+def rollingaggregate(table, time, value, width, by=None, presorted=False,
+                     buffersize=None, tempdir=None, prefix='window_'):
+    """Compute rolling (moving window) statistics over a table of events.
+
+    Every input row is kept in the output, in ``(by, time)`` ascending
+    order, and four columns are appended: ``prefix + 'count'``,
+    ``prefix + 'sum'``, ``prefix + 'min'`` and ``prefix + 'max'``. For each
+    row, the window contains the rows of the same group that appear in the
+    result up to and including the current row and whose time is strictly
+    greater than the current time minus `width` (a row whose time is exactly
+    `time - width` is *not* included). Rows sharing the same time are
+    processed one at a time, in their original input order, so a record
+    never affects the statistics of an earlier record with the same time.
+    E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['id', 'time', 'value'],
+        ...           ['a', 1, 10],
+        ...           ['a', 2, 20],
+        ...           ['b', 3, 5],
+        ...           ['a', 4, None],
+        ...           ['a', 5, 7]]
+        >>> table2 = etl.rollingaggregate(table1, 'time', 'value', 3, by='id')
+        >>> table2
+        +-----+------+-------+--------------+------------+------------+------------+
+        | id  | time | value | window_count | window_sum | window_min | window_max |
+        +=====+======+=======+==============+============+============+============+
+        | 'a' |    1 |    10 |            1 |         10 |         10 |         10 |
+        +-----+------+-------+--------------+------------+------------+------------+
+        | 'a' |    2 |    20 |            2 |         30 |         10 |         20 |
+        +-----+------+-------+--------------+------------+------------+------------+
+        | 'a' |    4 | None  |            2 |         20 |         20 |         20 |
+        +-----+------+-------+--------------+------------+------------+------------+
+        | 'a' |    5 |     7 |            2 |          7 |          7 |          7 |
+        +-----+------+-------+--------------+------------+------------+------------+
+        | 'b' |    3 |     5 |            1 |          5 |          5 |          5 |
+        +-----+------+-------+--------------+------------+------------+------------+
+
+        >>> # without a `by` field a single group is assumed, and the data
+        >>> # are sorted by time only
+        ... table3 = etl.rollingaggregate(table1, 'time', 'value', 2)
+        >>> table3
+        +-----+------+-------+--------------+------------+------------+------------+
+        | id  | time | value | window_count | window_sum | window_min | window_max |
+        +=====+======+=======+==============+============+============+============+
+        | 'a' |    1 |    10 |            1 |         10 |         10 |         10 |
+        +-----+------+-------+--------------+------------+------------+------------+
+        | 'a' |    2 |    20 |            2 |         30 |         10 |         20 |
+        +-----+------+-------+--------------+------------+------------+------------+
+        | 'b' |    3 |     5 |            2 |         25 |          5 |         20 |
+        +-----+------+-------+--------------+------------+------------+------------+
+        | 'a' |    4 | None  |            2 |          5 |          5 |          5 |
+        +-----+------+-------+--------------+------------+------------+------------+
+        | 'a' |    5 |     7 |            2 |          7 |          7 |          7 |
+        +-----+------+-------+--------------+------------+------------+------------+
+
+    The `time` and `value` arguments are single field names. The `by`
+    argument may be None, a single field name, or a non-empty sequence of
+    field names; grouping follows the sort semantics of
+    :func:`petl.transform.sorts.sort`, so `None` is allowed as a group
+    value.
+
+    Time values and `width` use an integer time scale: times may be
+    negative integers, `width` must be a positive integer, and neither may
+    be a bool. Values must be integers or None (bool is not accepted).
+    Statistics are computed with exact integer arithmetic, so large
+    integers are not degraded by conversion to float.
+
+    The `count` column counts every row in the window, while `sum`, `min`
+    and `max` are computed over the non-None values only; when the window
+    contains no non-None value they are 0, None and None respectively.
+    Duplicate rows and duplicate values are each counted as many times as
+    they occur.
+
+    If `presorted` is True, the input is assumed to be already ordered by
+    the `by` fields and `time` (stable, ascending), each row is read only
+    once and its result is available as soon as the row itself has been
+    read. Otherwise the input may be in any order and is sorted first; the
+    `buffersize` and `tempdir` arguments have the same meaning as for
+    :func:`petl.transform.sorts.sort`. Both paths produce identical row
+    order and statistics.
+
+    Window maintenance is incremental: rows that fall out of the window are
+    discarded and never contribute again, state is reset whenever the group
+    changes, and the memory used is proportional to the size of the current
+    window rather than the history seen so far. For N rows and a peak
+    window of W rows the total work of maintaining the statistics is O(N)
+    (amortised O(1) per row, i.e., better than O(N log(W+1))), excluding
+    the cost of sorting when `presorted` is False.
+
+    See also :func:`petl.transform.reductions.aggregate` and
+    :func:`petl.transform.reductions.fold`.
+
+    """
+
+    return RollingAggregateView(table, time, value, width, by=by,
+                                presorted=presorted, buffersize=buffersize,
+                                tempdir=tempdir, prefix=prefix)
+
+
+Table.rollingaggregate = rollingaggregate
+
+
+# name of the internal column used to carry the original row number through
+# the sort; only ever used positionally, so a collision with a user field
+# name is harmless
+_ROLLING_ROWNUM_FIELD = '__rolling_rownum__'
+
+
+def _rolling_validatename(name, arg):
+    if not isinstance(name, string_types):
+        raise ArgumentError('%s must be a single field name (a string), '
+                            'got %r' % (arg, name))
+    return name
+
+
+def _rolling_validateby(by):
+    if by is None:
+        return ()
+    if isinstance(by, string_types):
+        by = (by,)
+    elif isinstance(by, (list, tuple)):
+        if len(by) == 0:
+            raise ArgumentError('by must be None, a field name, or a '
+                                'non-empty sequence of field names')
+        by = tuple(by)
+    else:
+        raise ArgumentError('by must be None, a field name, or a sequence '
+                            'of field names, got %r' % (by,))
+    for b in by:
+        if not isinstance(b, string_types):
+            raise ArgumentError('by must contain only field names '
+                                '(strings), got %r' % (b,))
+    if len(set(by)) != len(by):
+        raise ArgumentError('by contains duplicate field names: %r' % (by,))
+    return by
+
+
+def _rolling_validatewidth(width):
+    if isinstance(width, bool) or not isinstance(width, integer_types):
+        raise ArgumentError('width must be a positive integer, got %r'
+                            % (width,))
+    if width < 1:
+        raise ArgumentError('width must be a positive integer, got %r'
+                            % (width,))
+    return width
+
+
+def _rolling_closequietly(it):
+    close = getattr(it, 'close', None)
+    if close is not None:
+        try:
+            close()
+        except Exception:
+            # cleanup must never mask an exception already in flight
+            pass
+
+
+class RollingAggregateView(Table):
+
+    def __init__(self, table, time, value, width, by=None, presorted=False,
+                 buffersize=None, tempdir=None, prefix='window_'):
+        self.table = table
+        self.time = _rolling_validatename(time, 'time')
+        self.value = _rolling_validatename(value, 'value')
+        self.by = _rolling_validateby(by)
+        if self.time == self.value:
+            raise ArgumentError('time and value must be different fields, '
+                                'got %r' % (self.time,))
+        if self.time in self.by:
+            raise ArgumentError('time field %r must not also appear in by'
+                                % (self.time,))
+        if self.value in self.by:
+            raise ArgumentError('value field %r must not also appear in by'
+                                % (self.value,))
+        self.width = _rolling_validatewidth(width)
+        if not isinstance(prefix, string_types):
+            raise ArgumentError('prefix must be a string, got %r'
+                                % (prefix,))
+        self.prefix = prefix
+        self.presorted = presorted
+        self.buffersize = buffersize
+        self.tempdir = tempdir
+        validated = _RollingValidatedTable(table, self.time, self.value,
+                                           self.by, self.prefix)
+        if presorted:
+            self._prepared = validated
+        else:
+            # N.B., no caching, so that re-iterating this view re-reads the
+            # source and reflects its current state
+            self._prepared = sort(validated,
+                                  key=list(self.by) + [self.time],
+                                  buffersize=buffersize, tempdir=tempdir,
+                                  cache=False)
+
+    def __iter__(self):
+        return _iterrollingaggregate(self._prepared, self.time, self.value,
+                                     self.by, self.width, self.prefix,
+                                     self.presorted)
+
+
+class _RollingValidatedTable(Table):
+    """A table wrapper that validates rows as they are consumed, tagging
+    each with its original (1-based) row number so errors can be reported
+    against the original input even after sorting."""
+
+    def __init__(self, source, time, value, by, prefix):
+        self.source = source
+        self.time = time
+        self.value = value
+        self.by = by
+        self.prefix = prefix
+
+    def __iter__(self):
+        return _itervalidatedrows(self.source, self.time, self.value,
+                                  self.by, self.prefix)
+
+
+def _itervalidatedrows(source, time, value, by, prefix):
+    it = iter(source)
+    try:
+        try:
+            hdr = next(it)
+        except StopIteration:
+            raise ArgumentError('expected a table with a header row, got '
+                                'an empty table')
+        hdr = tuple(hdr)
+        if not all(isinstance(f, string_types) for f in hdr):
+            raise ArgumentError('header must contain only string field '
+                                'names, got %r' % (hdr,))
+        if len(set(hdr)) != len(hdr):
+            raise ArgumentError('header contains duplicate field names: %r'
+                                % (hdr,))
+        # raises FieldSelectionError if a selected field is missing
+        tidx = asindices(hdr, time)[0]
+        vidx = asindices(hdr, value)[0]
+        if by:
+            asindices(hdr, list(by))
+        for suffix in ('count', 'sum', 'min', 'max'):
+            appended = prefix + suffix
+            if appended in hdr:
+                raise ArgumentError('appended field %r conflicts with an '
+                                    'existing field name' % (appended,))
+        yield hdr + (_ROLLING_ROWNUM_FIELD,)
+        nfields = len(hdr)
+        rownum = 0
+        for row in it:
+            rownum += 1
+            row = tuple(row)
+            if len(row) != nfields:
+                raise ArgumentError('row %d: expected %d fields, found %d'
+                                    % (rownum, nfields, len(row)))
+            t = row[tidx]
+            if isinstance(t, bool) or not isinstance(t, integer_types):
+                raise ArgumentError('row %d: time value must be an '
+                                    'integer, found %r' % (rownum, t))
+            v = row[vidx]
+            if v is not None and (isinstance(v, bool)
+                                  or not isinstance(v, integer_types)):
+                raise ArgumentError('row %d: value must be an integer or '
+                                    'None, found %r' % (rownum, v))
+            yield row + (rownum,)
+    finally:
+        _rolling_closequietly(it)
+
+
+class _RollingWindow(object):
+    """Incremental state for the window of one group.
+
+    Holds only the not-yet-expired entries, so the memory used follows the
+    size of the current window, not the history seen so far. `rows` keeps
+    (time, value) for every row in the window; `mins` and `maxs` are
+    monotonic deques of (time, value) over the non-None values, giving
+    amortised O(1) maintenance per row.
+    """
+
+    __slots__ = ('gkey', 'rows', 'mins', 'maxs', 'total')
+
+    def __init__(self, gkey):
+        self.gkey = gkey
+        self.rows = deque()
+        self.mins = deque()
+        self.maxs = deque()
+        self.total = 0
+
+    def expire(self, tmin):
+        # drop every entry with time <= tmin; entries are held in
+        # non-decreasing time order, so expired entries form a prefix
+        rows = self.rows
+        while rows and rows[0][0] <= tmin:
+            t0, v0 = rows.popleft()
+            if v0 is not None:
+                self.total -= v0
+        mins = self.mins
+        while mins and mins[0][0] <= tmin:
+            mins.popleft()
+        maxs = self.maxs
+        while maxs and maxs[0][0] <= tmin:
+            maxs.popleft()
+
+    def push(self, t, v):
+        self.rows.append((t, v))
+        if v is None:
+            return
+        self.total += v
+        mins = self.mins
+        while mins and mins[-1][1] >= v:
+            mins.pop()
+        mins.append((t, v))
+        maxs = self.maxs
+        while maxs and maxs[-1][1] <= v:
+            maxs.pop()
+        maxs.append((t, v))
+
+    def stats(self):
+        return (len(self.rows), self.total,
+                self.mins[0][1] if self.mins else None,
+                self.maxs[0][1] if self.maxs else None)
+
+
+def _iterrollingaggregate(prepared, time, value, by, width, prefix,
+                          checkorder):
+    it = iter(prepared)
+    try:
+        try:
+            hdr = next(it)
+        except StopIteration:
+            raise ArgumentError('expected a table with a header row')
+        hdr = tuple(hdr)
+        # the validated table guarantees the selected fields exist
+        tidx = asindices(hdr, time)[0]
+        vidx = asindices(hdr, value)[0]
+        bidx = tuple(asindices(hdr, list(by))) if by else ()
+        yield hdr[:-1] + (prefix + 'count', prefix + 'sum',
+                          prefix + 'min', prefix + 'max')
+        if bidx:
+            getgroup = comparable_itemgetter(*bidx)
+        else:
+            def getgroup(row):
+                return None
+        if checkorder:
+            getorder = comparable_itemgetter(*(bidx + (tidx,)))
+        state = None
+        prevorder = None
+        for arow in it:
+            rownum = arow[-1]
+            row = arow[:-1]
+            gkey = getgroup(row)
+            if state is None or not (gkey == state.gkey):
+                # group changed, nothing may leak across the boundary
+                state = _RollingWindow(gkey)
+            t = row[tidx]
+            if checkorder:
+                order = getorder(row)
+                if prevorder is not None and order < prevorder:
+                    raise ArgumentError('row %d: presorted input is not '
+                                        'ordered by %r' % (rownum,
+                                                           list(by) + [time]))
+                prevorder = order
+            state.expire(t - width)
+            state.push(t, row[vidx])
+            yield row + state.stats()
+    finally:
+        _rolling_closequietly(it)
