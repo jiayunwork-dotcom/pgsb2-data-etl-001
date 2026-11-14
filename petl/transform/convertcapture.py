@@ -111,10 +111,24 @@ def convertcapture(table, converters, buffersize=1000, tempdir=None):
 
     Source iterator failures, spool I/O or serialisation failures and
     configuration errors fail the whole capture rather than producing bad
-    rows. Each branch first yields any valid records already assigned to it
-    and then raises the same original exception at its end; the source is not
-    advanced afterwards. ``KeyboardInterrupt`` and other ``BaseException``
-    subclasses propagate immediately and terminate the capture.
+    rows. ``KeyboardInterrupt`` and other ``BaseException`` subclasses
+    propagate immediately and terminate the capture.
+
+    When a failure occurs, each branch still in use first yields the valid
+    records already assigned to it (the *valid prefix*) and then raises
+    the same original exception object at its end; the source is not
+    advanced afterwards and no further converter calls are made. If staging
+    a new record fails (a value that cannot be pickled, or a write, flush
+    or close error on a spool file), the record being staged is never
+    delivered, but every record queued before it remains deliverable,
+    exactly once and in order, even if serialisation had already written
+    partial bytes. If reading a spool file fails, the failure terminates
+    the whole capture: the source is closed promptly and records that can
+    no longer be read from the failed medium are not recovered, but the
+    branch neither skips past them to later rows nor reports a normal end
+    of input; it raises the original exception. A spool segment that
+    holds fewer records than expected (truncated spool content) fails the
+    same way and is never treated as a clean end of data.
 
     Closing a branch iterator (or calling ``branch.close()`` before
     iterating) permanently abandons that branch: its buffered records and
@@ -196,6 +210,17 @@ class _SpooledQueue(object):
     At most one spool file is open for reading at a time, alongside the
     (optional) file being written.
 
+    Durability contract: once :meth:`put` returns, the record is either in
+    the memory buffer or flushed to a spool file, so a failure while staging
+    a *later* record can never take earlier records down with it. Records
+    are serialised with ``pickle.dumps`` before the file is touched, so a
+    failing ``__reduce__`` leaves no partial bytes behind; a record whose
+    write or flush fails is excluded from the segment record count, and the
+    reader never reads past that count, so any partially written bytes are
+    never read back. A sealed segment that ends before its recorded count
+    (truncated or corrupted spool file) is a hard failure, never a clean
+    end of data.
+
     """
 
     def __init__(self, buffersize, tempdir):
@@ -231,11 +256,20 @@ class _SpooledQueue(object):
             # the memory buffer is full: further records go to disk
             self._open_active()
         try:
-            pickle.dump(record, self._active,
-                        protocol=pickle.HIGHEST_PROTOCOL)
+            # serialise before touching the file, so a failing __reduce__
+            # cannot leave partial bytes in the active segment
+            data = pickle.dumps(record, protocol=pickle.HIGHEST_PROTOCOL)
+            # flush every record: once put() returns, the record must be
+            # recoverable from the file even if a later write, flush or
+            # close fails
+            self._active.write(data)
+            self._active.flush()
         except BaseException:
-            # never leave a half-written record behind
-            self._close_active(discard=True)
+            # the failed record is dropped, but every record staged before
+            # it stays deliverable: keep the complete prefix of the active
+            # segment. The segment record count excludes the failed
+            # record, so any partially written bytes are never read back.
+            self._preserve_active()
             raise
         self._active_count += 1
         if self._active_count >= self.buffersize:
@@ -251,12 +285,14 @@ class _SpooledQueue(object):
                 self._reader = open(self._reader_path, 'rb')
             try:
                 record = pickle.load(self._reader)
-            except EOFError:
-                self._close_reader()
-                self._disk.popleft()
-                _unlink_quiet(self._reader_path)
-                self._reader_path = None
-                continue
+            except EOFError as exc:
+                # a sealed segment holds exactly its recorded number of
+                # records; ending early means the spool file was truncated
+                # or corrupted, which is a hard failure, not a clean EOF
+                raise EOFError(
+                    'convertcapture spool file %r ended with %d record(s) '
+                    'still unread' % (self._reader_path, self._disk[0][1])
+                ) from exc
             self._disk[0][1] -= 1
             if self._disk[0][1] == 0:
                 self._close_reader()
@@ -279,29 +315,52 @@ class _SpooledQueue(object):
         self._active_count = 0
 
     def _seal_active(self):
-        self._active.flush()
-        self._active.close()
-        self._disk.append([self._active_name, self._active_count])
+        f, name, count = self._active, self._active_name, self._active_count
         self._active = None
         self._active_name = None
         self._active_count = 0
-
-    def _close_active(self, discard):
+        # every record in the segment was already flushed by put(), so no
+        # flush is needed here; a close error cannot lose staged records
+        # and is pure cleanup
         try:
-            self._active.close()
-        finally:
-            if discard and self._active_name is not None:
-                _unlink_quiet(self._active_name)
-            self._active = None
-            self._active_name = None
-            self._active_count = 0
+            f.close()
+        except BaseException:
+            pass
+        self._disk.append([name, count])
+
+    def _preserve_active(self):
+        """Seal the complete records of the active segment after a failure.
+
+        Called when staging a record fails: the failed record itself is
+        dropped, but records already written and flushed remain deliverable
+        through the sealed-segment path. Never raises.
+        """
+        f, name, count = self._active, self._active_name, self._active_count
+        self._active = None
+        self._active_name = None
+        self._active_count = 0
+        if f is None:
+            return
+        try:
+            f.close()
+        except BaseException:
+            # the records were flushed when staged; a failing close cannot
+            # make them unreadable and must not mask the staging failure
+            pass
+        if count:
+            self._disk.append([name, count])
+        else:
+            _unlink_quiet(name)
 
     def _close_reader(self):
         if self._reader is not None:
             try:
                 self._reader.close()
-            finally:
-                self._reader = None
+            except BaseException:
+                # the records were already delivered; a failing close is
+                # pure cleanup and must not mask an earlier failure
+                pass
+            self._reader = None
 
     def close(self):
         if self.closed:
@@ -309,7 +368,14 @@ class _SpooledQueue(object):
         self.closed = True
         self._mem.clear()
         if self._active is not None:
-            self._close_active(discard=True)
+            try:
+                self._active.close()
+            except BaseException:
+                pass
+            _unlink_quiet(self._active_name)
+            self._active = None
+            self._active_name = None
+            self._active_count = 0
         self._close_reader()
         while self._disk:
             path, _remaining = self._disk.popleft()
@@ -546,7 +612,12 @@ class ConvertCapture(object):
         if self._abandoned[side]:
             return
         self._abandoned[side] = True
-        self._queues[side].close()
+        try:
+            self._queues[side].close()
+        except BaseException:
+            # abandonment often runs while the original failure is being
+            # propagated; a cleanup error must never replace it
+            pass
         if self._abandoned['good'] and self._abandoned['bad']:
             # nobody left to consume: stop pulling and release everything
             self._terminate()
@@ -561,7 +632,10 @@ class ConvertCapture(object):
                 # surfaced by the explicit close() path instead
                 pass
         for side in ('good', 'bad'):
-            self._queues[side].close()
+            try:
+                self._queues[side].close()
+            except BaseException:
+                pass
 
     def _next_branch(self, side):
         if self._closed:
@@ -572,7 +646,15 @@ class ConvertCapture(object):
         queue = self._queues[side]
         while True:
             if len(queue) > 0:
-                return queue.get()
+                try:
+                    return queue.get()
+                except BaseException as exc:
+                    # a spool read failure terminates the whole capture:
+                    # the source is closed and never advanced again, and
+                    # every branch still in use observes the same original
+                    # failure after delivering its own readable prefix
+                    self._fail(exc)
+                    raise self._failure
             # nothing waiting for this branch: drive the shared pipeline,
             # unless everything has already been processed
             if self._finished:

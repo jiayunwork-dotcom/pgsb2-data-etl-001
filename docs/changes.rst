@@ -4,6 +4,17 @@ Changes
 Next version
 ------------
 
+* Hardened :func:`petl.convertcapture` spool failure handling. A failure
+  while staging a record (unpicklable value, or a spool write/flush/close
+  error) no longer discards records already queued for the same branch:
+  each branch delivers its valid queued prefix in order and then raises the
+  original exception. A spool read failure now terminates the whole
+  capture — the source is closed promptly and never advanced, and every
+  branch still in use raises the same original exception instead of
+  treating the failed batch as a normal end of input. Truncated spool
+  segments now fail explicitly rather than being skipped as a clean EOF,
+  and cleanup errors during teardown no longer mask the first failure.
+
 * Added :func:`petl.convertcapture`, a single-pass conversion that reads the
   input table at most once and routes fully converted rows to a ``good``
   branch and failed or wrong-width rows to a fixed-schema ``bad`` branch.
