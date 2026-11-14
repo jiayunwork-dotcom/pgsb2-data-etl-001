@@ -4,6 +4,17 @@ Changes
 Version 1.7.32
 --------------
 
+* Add ``petl.evolvepartitioned()`` for metadata-only schema evolution of
+  Hive-style partitioned datasets. Non-partition columns are tracked by
+  stable ids, so ``add``, ``rename``, ``drop`` and ``reorder`` operations
+  leave existing CSV files untouched: renames follow the old values,
+  dropped columns stay gone (a re-added column of the same name is a new
+  column), and historical rows are filled on read with the per-column
+  default recorded when the column was created. Evolutions use the same
+  atomic, versioned commit rules as ``topartitioned()``, and datasets
+  written without evolution metadata remain readable and writable without
+  a migration step.
+
 * Use PETL's mixed-type ordering for variable names discovered by
   ``recast()``, allowing tables with mixed-type headers to be melted and
   recast without a comparison error.

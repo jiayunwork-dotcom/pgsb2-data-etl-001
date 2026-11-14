@@ -175,8 +175,55 @@ petl's comparison semantics (``None`` sorts first); within a partition,
 rows are ordered by commit and then by their original input order. An empty
 dataset yields its header only.
 
+Schema evolution
+""""""""""""""""
+
+The logical non-partition schema can change over time without rewriting any
+historical data via :func:`petl.io.partitioned.evolvepartitioned`. Each
+non-partition column has a stable numeric id stored in the dataset metadata;
+data files record the ids of the columns they contain. An evolution is a
+metadata-only commit that never opens, scans, renames or rewrites a CSV
+file, so its cost depends on the number of files and fields but never on
+the number of data rows. Files keep their paths and bytes through any
+number of evolutions, and another process sees the result by reading the
+committed metadata rather than any in-memory cache.
+
+A call takes a non-empty list of operations, applied in the order given;
+the result of each operation is available to the next, and if any
+operation is invalid the whole batch is rejected with an
+:class:`petl.errors.ArgumentError` and nothing is committed:
+
+* ``('add', name, default)`` appends a column at the end of the
+  non-partition fields. ``default`` must be a string (the empty string is
+  allowed). The default only fills rows of files committed *before* the
+  column existed; rows written afterwards must supply the column
+  explicitly and short input rows are never completed with defaults.
+* ``('rename', old, new)`` renames a column in place. Because columns are
+  tracked by id, values in existing files follow the new name.
+* ``('drop', name)`` removes a column; its values no longer appear when
+  the dataset is read. Adding a column with the same name later creates a
+  brand new column with a new id, so values of the dropped column are
+  never recovered from the old files (historical rows instead receive the
+  new column's default).
+* ``('reorder', names)`` reorders the non-partition fields; ``names``
+  must contain every current non-partition field exactly once.
+
+Renames, reorders and later additions never change the default a
+historical row originally received. Partition fields never participate in
+an evolution, names may not collide with partition field names, and at
+least one non-partition field must remain after every operation.
+Evolutions follow the same lock and optimistic version rules as writes:
+two evolutions, or an evolution and a write, based on the same old
+version cannot both commit, and the loser raises
+:class:`petl.errors.PartitionCommitConflict` without altering the winner's
+schema or data. Datasets written by petl versions without evolution
+support (no schema metadata) are read, evolved and written directly; no
+separate migration script is required, and datasets that never use the
+new interface keep their original behaviour.
+
 .. autofunction:: petl.io.partitioned.topartitioned
 .. autofunction:: petl.io.partitioned.frompartitioned
+.. autofunction:: petl.io.partitioned.evolvepartitioned
 
 
 .. module:: petl.io.pickle
