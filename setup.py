@@ -21,6 +21,7 @@ setup(
     extras_require={
         'avro': ['fastavro>=0.24.0'],
         'bcolz': ['bcolz>=1.2.1'],
+        'calibrate': ['numpy>=1.16.4', 'scipy>=1.1.0'],
         'db': ['SQLAlchemy>=1.3.6'],
         'hdf5': ['cython>=0.29.13', 'numpy>=1.16.4', 'numexpr>=2.6.9', 
                  'tables>=3.5.2'],

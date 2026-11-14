@@ -228,6 +228,18 @@ Grouping sets (mergeable aggregation)
    :members: merge, totable, dumps, key, sets, measures, batches
 
 
+.. module:: petl.transform.calibration
+.. _transform_calibration:
+
+Calibrating sample weights
+--------------------------
+
+.. autofunction:: petl.transform.calibration.calibrateweights
+.. autoclass:: petl.transform.calibration.CalibratedTable
+.. autoexception:: petl.errors.CalibrationError
+   :members: reason
+
+
 .. module:: petl.transform.reshape
 .. _transform_reshape:
 

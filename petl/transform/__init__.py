@@ -33,6 +33,8 @@ from petl.transform.reductions import rowreduce, mergeduplicates,\
 from petl.transform.groupingsets import groupstate, groupingsets, \
     loadgroupstate, GroupState
 
+from petl.transform.calibration import calibrateweights, CalibratedTable
+
 from petl.transform.fills import filldown, fillright, fillleft
 
 from petl.transform.regex import capture, split, search, searchcomplement, \

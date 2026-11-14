@@ -14,6 +14,19 @@ Unreleased
   state, and the ``Table.groupstate`` and ``Table.groupingsets`` convenience
   methods.
 
+* Added :func:`petl.transform.calibration.calibrateweights` for calibrating
+  per-row base weights to one or more overlapping population margins within a
+  multiplicative ``bounds`` band, minimizing the entropy distance
+  ``sum(w_i log(w_i/d_i) - w_i + d_i)`` subject to the margin totals. The
+  source is read once through a single iterator, and the result is a
+  repeatable :class:`petl.transform.calibration.CalibratedTable` retaining the
+  original rows with a calibrated-weight column appended. Added
+  :class:`petl.errors.CalibrationError` (a subclass of
+  :class:`petl.errors.ArgumentError`) with ``reason`` in
+  ``'infeasible'``, ``'iteration_limit'`` and ``'numerical_failure'``. The
+  solver uses only the standard library; an optional ``calibrate`` extra
+  (NumPy/SciPy) adds a linear-programming infeasibility certificate.
+
 Version 1.7.32
 --------------
 

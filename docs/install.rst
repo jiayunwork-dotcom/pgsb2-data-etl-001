@@ -60,6 +60,13 @@ interval
 avro
   For using :ref:`Avro files <io_avro>` with `fastavro`
 
+calibrate
+  For the optional LP infeasibility certificate used by
+  :func:`petl.transform.calibration.calibrateweights`, with `numpy` and
+  `scipy`. Calibration itself runs without these packages using a
+  standard-library solver; the extra only adds the linear-programming
+  feasibility check.
+
 pandas
   For using :ref:`DataFrames <io_pandas>` with `pandas`
 
