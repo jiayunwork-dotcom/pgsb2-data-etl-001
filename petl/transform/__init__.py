@@ -45,6 +45,8 @@ from petl.transform.unpacks import unpack, unpackdict
 from petl.transform.dedup import duplicates, unique, distinct, conflicts, \
     isunique
 
+from petl.transform.keys import discoverkeys
+
 from petl.transform.setops import complement, intersection, \
     recordcomplement, diff, recorddiff, hashintersection, hashcomplement, \
     keydiff

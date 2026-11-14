@@ -196,6 +196,7 @@ Deduplicating rows
 .. autofunction:: petl.transform.dedup.conflicts
 .. autofunction:: petl.transform.dedup.distinct
 .. autofunction:: petl.transform.dedup.isunique
+.. autofunction:: petl.transform.keys.discoverkeys
 
 
 .. module:: petl.transform.reductions

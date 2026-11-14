@@ -4,6 +4,13 @@ Changes
 Version 1.7.32
 --------------
 
+* Add ``discoverkeys()`` to :mod:`petl.transform.keys` (also available as
+  ``Table.discoverkeys()``), which returns every minimal candidate key found
+  in the current data batch as a tuple of field-name tuples. It treats
+  ``None`` and NaN as missing, applies Python equality semantics, streams a
+  source once, buffers at most ``buffersize`` records with spill files under
+  ``tempdir``, and re-checks every later batch rather than caching a result.
+
 * Add ``keydiff()`` to :mod:`petl.transform.setops`, turning two table
   snapshots into a key-ordered change stream of ``insert``, ``update`` and
   ``delete`` records. It supports compound keys, reordered headers, ``None``
