@@ -24,7 +24,7 @@ from petl import fromjson
 from petl.errors import ArgumentError
 from petl.io import json as json_module
 from petl.io.json_streaming import (
-    _ChunkedTextStream,
+    _ChunkedByteStream,
     _iter_array_records,
     _EMPTY_READ_EOF,
 )
@@ -695,10 +695,13 @@ def test_memory_source(tmpdir):
 
 def test_long_whitespace_does_not_accumulate_memory():
     data = b'[{"a": 1}' + b' ' * 200000 + b', {"a": 2}]'
-    stream = _ChunkedTextStream(io.BytesIO(data), chunksize=64)
+    stream = _ChunkedByteStream(io.BytesIO(data), chunksize=64)
     records = _iter_array_records(stream, 8388608)
-    next(records)  # consume the first object, then scan the whitespace gap
-    peak_buffered = sum(len(chunk) for chunk in stream._chunks)
+    # drive the scanner through the whole inter-record whitespace gap,
+    # tracking the retained buffer at every step
+    peak_buffered = 0
+    for _ in records:
+        peak_buffered = max(peak_buffered, len(stream._buf) - stream._head)
     assert peak_buffered < 5000
 
 

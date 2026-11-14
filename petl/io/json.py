@@ -141,6 +141,25 @@ def fromjson(source, *args, **kwargs):
     violations raise :class:`petl.errors.ArgumentError`. Results already
     yielded before a malformed suffix are not withdrawn.
 
+    Delivered rows and the reported error do not depend on how the binary
+    stream is split into reads: the same byte string always yields the same
+    complete prefix of records and the same earliest error, even when a
+    single read returns one byte at a time. Error ordering inside one
+    unfinished object is deterministic: if a JSON syntax error has already
+    become definite before the first bad UTF-8 byte, a
+    :class:`~json.JSONDecodeError` is raised; otherwise the
+    :class:`UnicodeDecodeError` wins and the illegal bytes are never
+    replaced or ignored. A prefix that is merely incomplete -- truncated
+    JSON or a multi-byte UTF-8 character split across reads -- is not an
+    error until the source reaches EOF. When header sampling is enabled,
+    neither the header nor any row is delivered if an error occurs before
+    the sample is complete; once sampling has completed, the fully read
+    records are delivered in order and a later error cannot withdraw them.
+    JSONDecodeError positions (``pos``, ``lineno``, ``colno`` and the
+    position in the message) count decoded Unicode characters, never raw
+    byte offsets; the UnicodeDecodeError keeps its real illegal bytes while
+    its relative start/end is not remapped to a file offset.
+
     .. versionchanged:: 1.1.0
 
     If no `header` is specified, fields will be discovered by sampling keys

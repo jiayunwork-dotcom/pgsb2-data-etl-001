@@ -4,6 +4,18 @@ Changes
 Version 1.7.32
 --------------
 
+* Made ``fromjson(..., streaming=True)`` independent of how the binary
+  source splits its reads. The streaming reader now scans the raw bytes and
+  validates UTF-8 on the assembled sequences, so the same byte string
+  delivers the same complete prefix of records and reports the same
+  earliest error for any ``chunksize`` or short-read pattern. Inside one
+  unfinished object, a JSON syntax error that is definite before the first
+  bad UTF-8 byte raises ``JSONDecodeError``; otherwise the
+  ``UnicodeDecodeError`` is raised with the illegal bytes intact. Incomplete
+  JSON or UTF-8 prefixes wait for more input and are only judged at EOF, and
+  an error before header sampling completes delivers neither header nor
+  rows. JSON error positions count decoded Unicode characters.
+
 * Added an optional streaming mode to ``fromjson()`` via ``streaming=True``
   for UTF-8 files whose top level value is a JSON array of objects. Records
   are read incrementally from local, compressed and custom binary sources
