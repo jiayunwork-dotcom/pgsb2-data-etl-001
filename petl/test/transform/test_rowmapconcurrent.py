@@ -2,6 +2,7 @@ from __future__ import absolute_import, print_function, division
 
 import gc
 import threading
+import time
 import weakref
 
 import pytest
@@ -49,11 +50,12 @@ class Consumer(threading.Thread):
     """Drive an iterator in a separate thread so the test thread stays free
     to coordinate events while a next() call is in flight."""
 
-    def __init__(self, it):
+    def __init__(self, it, on_row=None):
         super(Consumer, self).__init__()
         self.it = it
         self.rows = []
         self.error = None
+        self.on_row = on_row
         self.done = threading.Event()
         self.first_row = threading.Event()
 
@@ -62,6 +64,8 @@ class Consumer(threading.Thread):
         try:
             for row in self.it:
                 self.rows.append(row)
+                if self.on_row is not None:
+                    self.on_row(row)
                 if first:
                     self.first_row.set()
                     first = False
@@ -78,7 +82,8 @@ def _counting_source(rows):
     the thread doing the calls."""
     header = rows[0]
     data = list(rows[1:])
-    state = {'next_calls': 0, 'threads': set(), 'closed': False}
+    state = {'next_calls': 0, 'threads': set(), 'closed': False,
+             'close_calls': 0}
 
     class CountingIterator(object):
 
@@ -99,6 +104,7 @@ def _counting_source(rows):
 
         def close(self):
             state['closed'] = True
+            state['close_calls'] += 1
 
     class CountingTable(object):
 
@@ -562,9 +568,15 @@ def test_rowmapconcurrent_failure_unordered_discards_later_results():
     release_slow = threading.Event()
     slow_started = threading.Event()
     ok_finished = threading.Event()
+    bad_raised = threading.Event()
 
     def rowmapper(row):
         if row[0] == 'bad':
+            # let every other admitted call start and the good row finish
+            # before the terminal failure fixes the completion boundary
+            assert ok_finished.wait(10)
+            assert slow_started.wait(10)
+            bad_raised.set()
             raise err
         if row[0] == 'slow':
             slow_started.set()
@@ -579,15 +591,16 @@ def test_rowmapconcurrent_failure_unordered_discards_later_results():
     assert next(it) == ('bar',)
     consumer = Consumer(it)
     consumer.start()
-    # release the still-running call as soon as the good row has been
-    # delivered, so teardown can join it without waiting out its blocking
-    # timeout; the slow row still finishes after the failure is observed
+    # release the still-running call only once the failure boundary has been
+    # recorded, so the slow row provably completes after it; teardown can then
+    # join it without waiting out its blocking timeout
 
-    def release_on_first_row():
-        consumer.first_row.wait(10)
+    def release_after_boundary():
+        assert bad_raised.wait(10)
+        assert it._state.failed.wait(10)
         release_slow.set()
 
-    watcher = threading.Thread(target=release_on_first_row)
+    watcher = threading.Thread(target=release_after_boundary)
     watcher.start()
     with Watchdog() as wd:
         # the good row finishes before the failure is observed
@@ -883,3 +896,735 @@ def test_rowmapconcurrent_validation_happens_without_source_read():
         rowmapconcurrent(source, lambda r: [r[0]], header=('a',),
                          workers=True)
     assert state['next_calls'] == 0
+
+
+# --------------------------------------------------------------------------
+# failure boundaries: a terminal failure must stop intake immediately
+# --------------------------------------------------------------------------
+
+class GatedSource(object):
+    """Source whose next() for data row n waits until data row n-1 has
+    entered the mapper (or a failure has been announced). This bounds how far
+    the pump can have read ahead when a row fails, and lets tests prove that
+    later rows never enter rowmapper."""
+
+    def __init__(self, values):
+        self.values = list(values)
+        self.i = 0
+        self.entered = {}
+        self.stop_wait = threading.Event()
+        self.lock = threading.Lock()
+        self.pulled = []
+        self.threads = set()
+        self.close_calls = 0
+
+    def entered_event(self, n):
+        with self.lock:
+            return self.entered.setdefault(n, threading.Event())
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.threads.add(threading.get_ident())
+        if self.i == 0:
+            self.i = 1
+            return ('foo',)
+        n = self.i - 1
+        if n >= 1:
+            ev = self.entered_event(n - 1)
+            deadline = time.monotonic() + 10
+            while not ev.is_set() and not self.stop_wait.is_set():
+                if time.monotonic() > deadline:
+                    raise AssertionError(
+                        'source next for row %d timed out waiting for row %d'
+                        % (n, n - 1))
+                ev.wait(0.01)
+        if n >= len(self.values):
+            raise StopIteration()
+        self.i += 1
+        self.pulled.append(n)
+        return (self.values[n],)
+
+    def close(self):
+        self.close_calls += 1
+
+
+def _drive_failing_repro(ordered, exc):
+    source = GatedSource(range(6))
+    calls = []
+    lock = threading.Lock()
+    caller_ident = threading.get_ident()
+
+    def rowmapper(row):
+        n = row[0]
+        with lock:
+            calls.append(n)
+        source.entered_event(n).set()
+        if n == 0:
+            source.stop_wait.set()
+            raise exc
+        return [n]
+
+    it = iter(rowmapconcurrent(source, rowmapper, header=('bar',),
+                               workers=1, maxpending=4, ordered=ordered))
+    assert next(it) == ('bar',)
+    with pytest.raises(type(exc)) as raised:
+        next(it)
+    assert raised.value is exc
+    time.sleep(0.1)
+    pulled_at_error = len(source.pulled)
+    assert calls == [0]
+    with pytest.raises(StopIteration):
+        next(it)
+    assert len(source.pulled) == pulled_at_error  # no pulls after the error
+    assert source.close_calls == 1
+    assert source.threads == {caller_ident}
+    assert _petl_threads() == []
+
+
+@pytest.mark.parametrize('ordered', [True, False])
+def test_failstop_reported_repro_row0(ordered):
+    _drive_failing_repro(ordered, OtherError('row 0 boom'))
+
+
+@pytest.mark.parametrize('ordered', [True, False])
+def test_failstop_reported_repro_keyboard_interrupt(ordered):
+    _drive_failing_repro(ordered, KeyboardInterrupt())
+
+
+def test_failstop_earlier_blocked_later_fails_ordered():
+    release_row0 = threading.Event()
+    row1_failed = threading.Event()
+    calls = []
+    lock = threading.Lock()
+    err = OtherError('row 1')
+
+    def rowmapper(row):
+        n = row[0]
+        with lock:
+            calls.append(n)
+        if n == 0:
+            assert release_row0.wait(10)
+            return ['zero']
+        if n == 1:
+            row1_failed.set()
+            raise err
+        return [str(n)]
+
+    table = (('foo',),) + tuple((i,) for i in range(8))
+    it = iter(rowmapconcurrent(table, rowmapper, header=('bar',),
+                               workers=2, maxpending=6, ordered=True))
+    assert next(it) == ('bar',)
+    consumer = Consumer(it)
+    consumer.start()
+    with Watchdog() as wd:
+        wd.wait(row1_failed)
+        time.sleep(0.05)  # give a (buggy) free worker a chance to start row 2
+    assert calls == [0, 1]  # the boundary at row 1 stopped rows 2+
+    release_row0.set()
+    with Watchdog() as wd:
+        wd.wait(consumer.done)
+    assert consumer.rows == [('zero',)]   # earlier success delivered first
+    assert consumer.error is err          # then the failure at row 1
+    with pytest.raises(StopIteration):
+        next(it)
+    assert _petl_threads() == []
+
+
+def test_failstop_earlier_row_waiting_retry_is_delivered():
+    # Row 0's retry is pending when row 1 fails terminally. The caller must
+    # not return the row-1 error early: row 0's retry still runs, its result
+    # is delivered, and only then is the error raised at row 1.
+    row0_first_attempt = threading.Event()
+    row1_failed = threading.Event()
+    retry_started = threading.Event()
+    allow_retry = threading.Event()
+    attempts = []
+    lock = threading.Lock()
+    err = OtherError('row 1 terminal')
+
+    def rowmapper(row):
+        n = row[0]
+        with lock:
+            attempts.append(n)
+            count0 = attempts.count(0)
+        if n == 0:
+            if count0 == 1:
+                row0_first_attempt.set()
+                raise RetryableError('retry row 0')
+            retry_started.set()
+            assert allow_retry.wait(10)
+            return ['zero']
+        if n == 1:
+            row1_failed.set()
+            raise err
+        return [str(n)]
+
+    table = (('foo',),) + tuple((i,) for i in range(6))
+    it = iter(rowmapconcurrent(table, rowmapper, header=('bar',),
+                               workers=2, maxpending=6, ordered=True,
+                               retry_on=(RetryableError,),
+                               retry_delays=(0.2,)))
+    assert next(it) == ('bar',)
+    consumer = Consumer(it)
+    consumer.start()
+    with Watchdog() as wd:
+        wd.wait(row0_first_attempt)
+        wd.wait(row1_failed)
+        wd.wait(retry_started)
+        # row 1 has already failed, but the caller still waits for row 0
+        assert consumer.rows == []
+        assert not consumer.done.is_set()
+    allow_retry.set()
+    with Watchdog() as wd:
+        wd.wait(consumer.done)
+    assert consumer.rows == [('zero',)]
+    assert consumer.error is err
+    assert attempts.count(0) == 2      # the retry really did run
+    assert 2 not in attempts and 3 not in attempts
+    assert _petl_threads() == []
+
+
+def test_failstop_cancels_delayed_retry_beyond_boundary():
+    # Row 2 is waiting on a one-hour retry when row 1 fails terminally. The
+    # out-of-boundary retry must be cancelled at once and never call
+    # rowmapper again.
+    row2_first = threading.Event()
+    attempts = []
+    lock = threading.Lock()
+    err = OtherError('row 1 terminal')
+
+    def rowmapper(row):
+        n = row[0]
+        with lock:
+            attempts.append(n)
+            count2 = attempts.count(2)
+        if n == 0:
+            return ['zero']
+        if n == 1:
+            assert row2_first.wait(10)
+            raise err
+        if n == 2:
+            if count2 == 1:
+                row2_first.set()
+                raise RetryableError('row 2 retry')
+            return ['two']
+        return [str(n)]
+
+    table = (('foo',),) + tuple((i,) for i in range(6))
+    it = iter(rowmapconcurrent(table, rowmapper, header=('bar',),
+                               workers=3, maxpending=3, ordered=True,
+                               retry_on=(RetryableError,),
+                               retry_delays=(3600,)))
+    assert next(it) == ('bar',)
+    assert next(it) == ('zero',)       # row 0's success is delivered first
+    with pytest.raises(OtherError) as raised:
+        next(it)  # then the row-1 failure
+    assert raised.value is err
+    snapshot = list(attempts)
+    time.sleep(0.2)
+    # no new call of any kind after the boundary was reported, and in
+    # particular the hour-long retry for row 2 was cancelled rather than run
+    assert attempts == snapshot
+    assert attempts.count(2) == 1
+    with pytest.raises(StopIteration):
+        next(it)
+    assert _petl_threads() == []
+
+
+def test_failstop_earlier_boundary_wins_when_it_fails_later_ordered():
+    # Row 2 fails first (completion order), then row 1 fails. The boundary
+    # must retreat to the earlier input row, whose exception object wins.
+    row2_failed = threading.Event()
+    calls = []
+    lock = threading.Lock()
+    err1 = OtherError('row 1')
+    err2 = OtherError('row 2')
+
+    def rowmapper(row):
+        n = row[0]
+        with lock:
+            calls.append(n)
+        if n == 0:
+            return ['zero']
+        if n == 1:
+            assert row2_failed.wait(10)
+            raise err1
+        if n == 2:
+            row2_failed.set()
+            raise err2
+        return [str(n)]
+
+    table = (('foo',),) + tuple((i,) for i in range(3))
+    it = iter(rowmapconcurrent(table, rowmapper, header=('bar',),
+                               workers=3, maxpending=3, ordered=True))
+    assert next(it) == ('bar',)
+    assert next(it) == ('zero',)   # row 0 delivered, then the boundary
+    with pytest.raises(OtherError) as raised:
+        next(it)
+    assert raised.value is err1
+    assert sorted(calls) == [0, 1, 2]
+    with pytest.raises(StopIteration):
+        next(it)
+    assert _petl_threads() == []
+
+
+def test_failstop_first_boundary_stays_when_later_row_fails_ordered():
+    row1_failed = threading.Event()
+    row2_failed = threading.Event()
+    err1 = OtherError('row 1')
+    err2 = OtherError('row 2')
+
+    def rowmapper(row):
+        n = row[0]
+        if n == 0:
+            return ['zero']
+        if n == 1:
+            row1_failed.set()
+            raise err1
+        if n == 2:
+            assert row1_failed.wait(10)
+            row2_failed.set()
+            raise err2
+        return [str(n)]
+
+    table = (('foo',),) + tuple((i,) for i in range(3))
+    it = iter(rowmapconcurrent(table, rowmapper, header=('bar',),
+                               workers=3, maxpending=3, ordered=True))
+    assert next(it) == ('bar',)
+    assert next(it) == ('zero',)   # row 0 is delivered before the boundary
+    with pytest.raises(OtherError) as raised:
+        next(it)
+    assert raised.value is err1
+    with pytest.raises(StopIteration):
+        next(it)
+    assert _petl_threads() == []
+
+
+def test_failstop_unordered_delivers_completed_prefix_then_raises():
+    # Row 0 and row 1 complete before row 2 fails; row 3 completes after the
+    # boundary. The two prefix rows are delivered in completion order once
+    # each, row 3 is never delivered, then the original error is raised.
+    a_delivered = threading.Event()
+    b_done = threading.Event()
+    bad_failed = threading.Event()
+    release_late = threading.Event()
+    late_done = threading.Event()
+    err = OtherError('bad')
+
+    def rowmapper(row):
+        key = row[0]
+        if key == 'a':
+            return ['a-done']
+        if key == 'b':
+            # wait until 'a' was actually delivered, fixing completion order
+            assert a_delivered.wait(10)
+            b_done.set()
+            return ['b-done']
+        if key == 'bad':
+            assert b_done.wait(10)
+            bad_failed.set()
+            raise err
+        assert bad_failed.wait(10)
+        assert release_late.wait(10)
+        late_done.set()
+        return ['late-done']
+
+    def on_row(row):
+        if row == ('a-done',):
+            a_delivered.set()
+
+    table = (('foo',), ('a',), ('b',), ('bad',), ('late',))
+    it = iter(rowmapconcurrent(table, rowmapper, header=('bar',),
+                               workers=4, maxpending=4, ordered=False))
+    assert next(it) == ('bar',)
+    consumer = Consumer(it, on_row=on_row)
+    consumer.start()
+
+    def release_after_failure():
+        # once the failure boundary is recorded, let 'late' complete so
+        # teardown can join it; its result must still be discarded
+        bad_failed.wait(10)
+        assert it._state.failed.wait(10)
+        release_late.set()
+
+    watcher = threading.Thread(target=release_after_failure)
+    watcher.start()
+    with Watchdog() as wd:
+        wd.wait(consumer.done)
+    watcher.join(10)
+    # 'a' and 'b' completed before the boundary and are delivered once each
+    # in completion order; 'late' is discarded; then the original error.
+    assert consumer.rows == [('a-done',), ('b-done',)]
+    assert consumer.error is err
+    assert _petl_threads() == []
+    with pytest.raises(StopIteration):
+        next(it)
+
+
+def test_failstop_unordered_first_completed_failure_wins():
+    # Row 1 fails first in completion order even though row 2 has the larger
+    # input index; in unordered mode row 1's exception object is the one
+    # raised. (In ordered mode the earlier index governs instead.)
+    may_fail = threading.Event()
+    row1_failed = threading.Event()
+    err1 = OtherError('row 1')
+    err2 = OtherError('row 2')
+
+    def rowmapper(row):
+        n = row[0]
+        if n == 1:
+            assert may_fail.wait(10)
+            row1_failed.set()
+            raise err1
+        if n == 2:
+            assert may_fail.wait(10)
+            assert row1_failed.wait(10)   # row 1's failure completes first
+            raise err2
+        return [n]
+
+    # only rows 0, 1 and 2 exist, so no ungated later success can be
+    # published ahead of the failures
+    table = (('foo',),) + tuple((i,) for i in range(3))
+    it = iter(rowmapconcurrent(table, rowmapper, header=('bar',),
+                               workers=3, maxpending=3, ordered=False))
+    assert next(it) == ('bar',)
+    # row 0 has completed and is delivered before either failure is allowed
+    assert next(it) == (0,)
+    may_fail.set()
+    with pytest.raises(OtherError) as raised:
+        next(it)
+    # in unordered mode the boundary is the first failure to complete; both
+    # rows fail only after release, and row 1 won the completion race by
+    # ordering row 2 behind row 1's failure below
+    assert raised.value is err1
+    with pytest.raises(StopIteration):
+        next(it)
+    assert _petl_threads() == []
+
+
+def test_failstop_output_len_raises_same_object_not_retried():
+    class BadLen(object):
+        def __init__(self, exc):
+            self.exc = exc
+
+        def __len__(self):
+            raise self.exc
+
+    exc = RuntimeError('len exploded')
+    bad = BadLen(exc)
+    attempts = []
+
+    def rowmapper(row):
+        attempts.append(row[0])
+        if row[0] == 2:
+            return bad
+        return [row[0]]
+
+    table = (('foo',), (1,), (2,), (3,))
+    it = iter(rowmapconcurrent(table, rowmapper, header=('bar',),
+                               workers=1, retry_on=(RuntimeError,),
+                               retry_delays=(0, 0)))
+    assert next(it) == ('bar',)
+    assert next(it) == (1,)
+    with pytest.raises(RuntimeError) as raised:
+        next(it)
+    assert raised.value is exc             # the sequence's own object
+    assert attempts.count(2) == 1          # output handling is never retried
+    with pytest.raises(StopIteration):
+        next(it)
+    assert _petl_threads() == []
+
+
+def test_failstop_output_iter_raises_same_object_not_retried():
+    class BadIter(object):
+        def __init__(self, exc):
+            self.exc = exc
+
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            raise self.exc
+
+    exc = OtherError('iter exploded')
+    bad = BadIter(exc)
+    attempts = []
+
+    def rowmapper(row):
+        attempts.append(row[0])
+        if row[0] == 2:
+            return bad
+        return [row[0]]
+
+    table = (('foo',), (1,), (2,), (3,))
+    it = iter(rowmapconcurrent(table, rowmapper, header=('bar',),
+                               workers=1, retry_on=(OtherError,),
+                               retry_delays=(0, 0)))
+    assert next(it) == ('bar',)
+    assert next(it) == (1,)
+    with pytest.raises(OtherError) as raised:
+        next(it)
+    assert raised.value is exc
+    assert attempts.count(2) == 1
+    with pytest.raises(StopIteration):
+        next(it)
+    assert _petl_threads() == []
+
+
+def test_failstop_base_exception_stops_intake():
+    class Fatal(BaseException):
+        pass
+
+    fatal = Fatal('fatal')
+    source = GatedSource(range(6))
+    calls = []
+    lock = threading.Lock()
+
+    def rowmapper(row):
+        n = row[0]
+        with lock:
+            calls.append(n)
+        source.entered_event(n).set()
+        if n == 0:
+            source.stop_wait.set()
+            raise fatal
+        return [n]
+
+    it = iter(rowmapconcurrent(source, rowmapper, header=('bar',),
+                               workers=1, maxpending=4, ordered=True))
+    assert next(it) == ('bar',)
+    with pytest.raises(Fatal) as raised:
+        next(it)
+    assert raised.value is fatal
+    time.sleep(0.1)
+    assert calls == [0]
+    assert source.close_calls == 1
+    assert _petl_threads() == []
+
+
+def test_failstop_source_read_crossing_failure_unordered():
+    # A source next() for row 1 is already blocked when row 0 fails. That
+    # read is allowed to finish, but the returned row must not be mapped, and
+    # no further source reads may start.
+    read_in_flight = threading.Event()
+    allow_read_return = threading.Event()
+    row0_failed = threading.Event()
+    calls = []
+    err = OtherError('row 0')
+
+    class SlowSource(object):
+        def __init__(self):
+            self.i = 0
+            self.pulled = []
+            self.close_calls = 0
+            self.threads = set()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.threads.add(threading.get_ident())
+            if self.i == 0:
+                self.i = 1
+                return ('foo',)
+            n = self.i - 1
+            self.i += 1
+            if n == 1:
+                read_in_flight.set()
+                assert allow_read_return.wait(10)
+            self.pulled.append(n)
+            return (n,)
+
+        def close(self):
+            self.close_calls += 1
+
+    source = SlowSource()
+
+    def rowmapper(row):
+        calls.append(row[0])
+        if row[0] == 0:
+            row0_failed.set()
+            raise err
+        return [row[0]]
+
+    it = iter(rowmapconcurrent(source, rowmapper, header=('foo',),
+                               workers=1, maxpending=4, ordered=False))
+    assert next(it) == ('foo',)
+    consumer = Consumer(it)
+    consumer.start()
+    with Watchdog() as wd:
+        wd.wait(row0_failed)
+        wd.wait(read_in_flight)
+    allow_read_return.set()
+    with Watchdog() as wd:
+        wd.wait(consumer.done)
+    assert consumer.error is err
+    assert calls == [0]             # the crossed read's row was not mapped
+    assert source.pulled == [0, 1]  # the in-flight read finished
+    assert source.close_calls == 1
+    assert _petl_threads() == []
+
+
+def test_failstop_source_read_crossing_failure_ordered():
+    # Ordered variant: row 1 is the boundary, and a read for row 2 is in
+    # flight. Row 2 lies at the boundary, so it must not be mapped.
+    row1_failed = threading.Event()
+    read2_in_flight = threading.Event()
+    allow_read2 = threading.Event()
+    calls = []
+    pulled = []
+    err = OtherError('row 1')
+
+    class SlowSource(object):
+        def __init__(self):
+            self.i = 0
+            self.close_calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.i == 0:
+                self.i = 1
+                return ('foo',)
+            n = self.i - 1
+            self.i += 1
+            if n == 2:
+                assert row1_failed.wait(10)
+                read2_in_flight.set()
+                assert allow_read2.wait(10)
+            if n >= 4:
+                raise StopIteration()
+            pulled.append(n)
+            return (n,)
+
+        def close(self):
+            self.close_calls += 1
+
+    def rowmapper(row):
+        calls.append(row[0])
+        if row[0] == 0:
+            return [0]
+        if row[0] == 1:
+            row1_failed.set()
+            raise err
+        return [row[0]]
+
+    source = SlowSource()
+    it = iter(rowmapconcurrent(source, rowmapper, header=('foo',),
+                               workers=1, maxpending=4, ordered=True))
+    assert next(it) == ('foo',)
+    consumer = Consumer(it)
+    consumer.start()
+    with Watchdog() as wd:
+        wd.wait(read2_in_flight)
+    allow_read2.set()
+    with Watchdog() as wd:
+        wd.wait(consumer.done)
+    assert consumer.rows == [(0,)]
+    assert consumer.error is err
+    assert 2 not in calls and 3 not in calls
+    assert source.close_calls == 1
+    assert _petl_threads() == []
+
+
+def test_failstop_cleanup_does_not_mask_original_exception():
+    err = OtherError('boom')
+
+    class RaisingCloseSource(object):
+        def __init__(self):
+            self.i = 0
+            self.close_calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.i == 0:
+                self.i = 1
+                return ('foo',)
+            if self.i == 1:
+                self.i = 2
+                return (1,)
+            raise StopIteration()
+
+        def close(self):
+            self.close_calls += 1
+            raise RuntimeError('close blew up')
+
+    def rowmapper(row):
+        raise err
+
+    source = RaisingCloseSource()
+    it = iter(rowmapconcurrent(source, rowmapper, header=('foo',),
+                               workers=1))
+    assert next(it) == ('foo',)
+    with pytest.raises(OtherError) as raised:
+        next(it)
+    assert raised.value is err         # close's error did not replace it
+    assert source.close_calls == 1
+    with pytest.raises(StopIteration):
+        next(it)
+    assert _petl_threads() == []
+
+
+def test_failstop_worker_internal_error_reaches_caller(monkeypatch):
+    # If a worker hits an unexpected internal error outside the rowmapper and
+    # output handlers, it must surface it instead of dying silently and
+    # leaving the caller waiting forever.
+    import petl.transform.maps as maps
+
+    def boom(state, job):
+        raise RuntimeError('internal worker error')
+
+    monkeypatch.setattr(maps, '_process_job', boom)
+    it = iter(rowmapconcurrent((('foo',), (1,), (2,)), lambda r: [r[0]],
+                               header=('bar',), workers=1))
+    assert next(it) == ('bar',)
+    consumer = Consumer(it)
+    consumer.daemon = True
+    consumer.start()
+    with Watchdog() as wd:
+        wd.wait(consumer.done)
+    assert isinstance(consumer.error, RuntimeError)
+    assert 'internal worker error' in str(consumer.error)
+    assert _petl_threads() == []
+
+
+# --------------------------------------------------------------------------
+# normal-path regression alongside the new failure machinery
+# --------------------------------------------------------------------------
+
+def test_failstop_normal_path_still_ordered_and_bounded():
+    release = threading.Event()
+    two_running = threading.Event()
+    inside = []
+    lock = threading.Lock()
+    table, state = _counting_source(
+        (('foo',),) + tuple((i,) for i in range(10)))
+
+    def rowmapper(row):
+        with lock:
+            inside.append(row[0])
+            if len(inside) == 2:
+                two_running.set()
+        assert release.wait(10)
+        return [row[0]]
+
+    it = iter(rowmapconcurrent(table, rowmapper, header=('foo',),
+                               workers=2, maxpending=4, ordered=True))
+    assert next(it) == ('foo',)
+    consumer = Consumer(it)
+    consumer.start()
+    with Watchdog() as wd:
+        wd.wait(two_running)
+    assert state['next_calls'] <= 1 + 4
+    release.set()
+    with Watchdog() as wd:
+        wd.wait(consumer.done)
+    assert consumer.error is None
+    assert [r[0] for r in consumer.rows] == list(range(10))
+    assert state['closed'] is True
+    assert _petl_threads() == []

@@ -465,21 +465,48 @@ def rowmapconcurrent(table, rowmapper, header, workers=4, maxpending=None,
     position. Any other exception, or exhausting the retries, makes the
     row fail.
 
-    Failure semantics differ by mode:
+    Failure semantics differ by mode. A *terminal* failure is a non-retryable
+    exception, exhausted retries, an invalid `rowmapper` result, or any
+    :class:`BaseException`; a retryable exception with attempts remaining
+    is not terminal.
 
-    * with `ordered` true, all results before the failing row are delivered
-      first, then the original exception object is raised at the failing
-      row's position;
-    * with `ordered` false, results that finished before the failure are
-      delivered in completion order, then the original exception object is
-      raised; results that finish afterwards are never delivered.
+    * with `ordered` true, the failure position is the input row index. Once
+      row *j* has failed terminally, no further rows are pulled from the
+      source and no new calls (or retries) are started for rows at or after
+      *j*; calls already running may finish, but their results are not
+      delivered. Rows before *j* still follow the normal retry rules, their
+      successful prefix is delivered in order, and then the original
+      exception object is raised at *j*'s position. If an earlier row later
+      fails terminally too, the boundary moves back to that earlier row.
+      A retry that is waiting when the boundary is set is not abandoned for
+      rows before the boundary (the prefix is still owed), while retries at
+      or after the boundary are cancelled immediately.
+    * with `ordered` false, results are delivered in completion order. The
+      first terminal failure to complete fixes the boundary: successful
+      results that completed before it are each delivered once in completion
+      order, results that complete afterwards are discarded, and then that
+      boundary failure's original exception object is raised. No source
+      reads and no new calls or retries start once the boundary is fixed.
+      Simultaneous completions may be ordered either way, but delivery and
+      the stop-intake decision both follow that single chosen order.
 
-    After a failure no more rows are pulled from the source, no new
-    `rowmapper` calls are started and scheduled retries are cancelled;
-    further ``next()`` calls end the iteration. :class:`BaseException`
-    raised by `rowmapper` (e.g. :class:`KeyboardInterrupt`,
-    :class:`SystemExit`) is never retried and is re-raised in the caller
-    thread.
+    A source read already in flight when a failure is determined is allowed
+    to finish, but the row it returns only enters `rowmapper` if it still
+    falls within the boundary described above. Calls already running are
+    not forcibly killed; before the exception (or a ``close()``) returns to
+    the caller, those calls are waited for, all threads of this iteration
+    have exited, and the source iterator is closed if it supports ``close()``.
+    Cleanup never replaces the caller's original exception, and excluded
+    delayed retries are cancelled without waiting out their delays. After
+    an error, further ``next()`` calls end the iteration.
+
+    If the object returned by `rowmapper` raises from its own ``__len__`` or
+    when it is iterated to build the final row, that same exception object
+    is handed to the caller; such output-handling errors are never retried.
+
+    :class:`BaseException` raised by `rowmapper` (e.g.
+    :class:`KeyboardInterrupt`, :class:`SystemExit`) is never retried and
+    is re-raised in the caller thread.
 
     The source table is only advanced in the thread that calls ``next()``
     on the result iterator, so thread-affine sources such as
@@ -605,32 +632,154 @@ class _ConcurrentState(object):
         self.closing = threading.Event()
         self.threads = []
 
+        # Terminal-failure boundary. ``failed`` is set as soon as a terminal
+        # failure is determined; workers consult it before starting any new
+        # call, and the caller stops pulling from the source.
+        # ``boundary_index`` is the input row index of the boundary failure in
+        # ordered mode and the input row index of the first failure to complete
+        # in unordered mode. The original exception object to re-raise travels
+        # in the published ``_Failure`` entry. ``completion_lock`` serialises
+        # boundary claims and result publication, so completion order and the
+        # delivery decision agree on one ordering.
+        self.failed = threading.Event()
+        self.boundary_index = None
+        self.completion_lock = threading.Lock()
+
+
+def _snapshot_boundary(state):
+    """Return ``(failed, boundary_index)`` under the completion lock so the
+    pair is always observed consistently."""
+    with state.completion_lock:
+        return state.failed.is_set(), state.boundary_index
+
+
+def _job_admitted(state, index):
+    """Decide whether a not-yet-started job may call `rowmapper` now.
+
+    In ordered mode rows before the failure boundary are still part of the
+    deliverable prefix and keep running (including their retries); rows at or
+    after the boundary must not start. In unordered mode the first completed
+    failure ends the intake, so no new call may start at all.
+    """
+    if state.closing.is_set():
+        return False
+    with state.completion_lock:
+        if not state.failed.is_set():
+            return True
+        if state.ordered:
+            boundary = state.boundary_index
+            return boundary is not None and index < boundary
+        return False
+
+
+def _prune_retries(state, keep_before):
+    """Drop scheduled retries for rows at or after the failure boundary.
+    ``keep_before`` is an exclusive row-index bound. Excluded delayed retries
+    are removed from the heap right away instead of waiting for their due
+    time; the timer is woken so it re-evaluates its next deadline."""
+    with state.timer_cond:
+        kept = [item for item in state.retry_heap
+                if item[2][0] < keep_before]
+        if len(kept) != len(state.retry_heap):
+            state.retry_heap = kept
+            heapq.heapify(state.retry_heap)
+        state.timer_cond.notify_all()
+
+
+def _publish_success(state, index, row):
+    """Publish a successful result unless it lies beyond the failure
+    boundary. Publication and boundary claims are serialised by the same
+    lock, which defines one consistent completion order."""
+    with state.completion_lock:
+        if state.failed.is_set():
+            if not state.ordered:
+                return
+            boundary = state.boundary_index
+            if boundary is None or index >= boundary:
+                return
+        state.results.put(_Success(index, row))
+
+
+def _publish_failure(state, index, error):
+    """Record a terminal failure and (the first time, or when an earlier row
+    fails) the boundary it establishes. The original exception object is
+    carried through unchanged."""
+    if state.ordered:
+        with state.completion_lock:
+            failed = state.failed.is_set()
+            if not failed:
+                state.boundary_index = index
+                state.failed.set()
+                promote = True
+            elif index < state.boundary_index:
+                # an earlier row failed afterwards: move the boundary back
+                state.boundary_index = index
+                promote = True
+            else:
+                # failure at or after the boundary: nothing to deliver or say
+                promote = False
+            if promote:
+                state.results.put(_Failure(index, error))
+            boundary = state.boundary_index
+        if promote:
+            _prune_retries(state, boundary)
+    else:
+        with state.completion_lock:
+            if state.failed.is_set():
+                return
+            state.boundary_index = index
+            state.failed.set()
+            state.results.put(_Failure(index, error))
+        _prune_retries(state, -1)
+
 
 def _teardown_state(state):
     if state.closed:
         return
     state.closed = True
     state.closing.set()
-    if state.started:
-        # wake the retry timer so any waiting retry is cancelled at once;
-        # workers discard queued jobs without calling rowmapper once closing
-        # is set, then exit on their sentinel
-        with state.timer_cond:
-            state.timer_cond.notify_all()
-        for _ in range(state.workers):
-            state.job_queue.put(_SENTINEL)
-        # join without a timeout: before this returns every in-flight
-        # rowmapper call must have finished and every thread must exit
-        for t in state.threads:
-            t.join()
-    source = state.source
-    if source is not None and hasattr(source, 'close'):
-        try:
-            source.close()
-        except Exception:
-            pass
-    # unblock any consumer still waiting on results (defensive)
-    state.results.put(_CLOSED)
+    try:
+        _teardown_impl(state)
+    except BaseException:
+        # Cleanup must never mask the exception the caller is about to see
+        # (most importantly BaseException such as KeyboardInterrupt). The
+        # joining of workers and closing of the source are each defensive
+        # below; this is just the last line of defence.
+        pass
+
+
+def _teardown_impl(state):
+    try:
+        if state.started:
+            # wake the retry timer so any waiting retry is cancelled at once;
+            # workers discard queued jobs without calling rowmapper once
+            # closing is set, then exit on their sentinel
+            try:
+                with state.timer_cond:
+                    state.timer_cond.notify_all()
+            except Exception:
+                pass
+            for _ in range(state.workers):
+                state.job_queue.put(_SENTINEL)
+            # join without a timeout: before this returns every in-flight
+            # rowmapper call must have finished and every thread must exit
+            current = threading.current_thread()
+            for t in state.threads:
+                if t is current:
+                    continue
+                try:
+                    t.join()
+                except Exception:
+                    pass
+    finally:
+        source = state.source
+        if source is not None and hasattr(source, 'close'):
+            try:
+                source.close()
+            except Exception:
+                pass
+        # unblock any consumer still waiting on results (defensive)
+        state.results.put(_CLOSED)
 
 
 class _RowMapConcurrentIterator(object):
@@ -714,16 +863,24 @@ class _RowMapConcurrentIterator(object):
 
     def _pump(self):
         """Pull rows from the source and submit them until the pending
-        window is full, the source is exhausted or the iterator is closing.
+        window is full, the source is exhausted, a terminal failure has
+        established a boundary, or the iterator is closing.
         """
         state = self._state
         while state.inflight < state.maxpending \
                 and not state.source_exhausted \
-                and not state.closing.is_set():
+                and not state.closing.is_set() \
+                and not state.failed.is_set():
             try:
                 raw_row = next(state.source)
             except StopIteration:
                 state.source_exhausted = True
+                return
+            # a failure may have been determined while the source read was in
+            # flight; the row just read must not be admitted past the boundary
+            failed, boundary = _snapshot_boundary(state)
+            if failed and (not state.ordered or boundary is None
+                           or state.next_index >= boundary):
                 return
             state.row_number += 1
             record = Record(raw_row, state.flds)
@@ -747,9 +904,9 @@ class _RowMapConcurrentIterator(object):
             raise StopIteration
         state.inflight -= 1
         if isinstance(outcome, _Failure):
-            # results already finished were queued ahead of this failure and
-            # have either been delivered or will be discarded; tear down,
-            # then raise the original exception object
+            # everything completed before the boundary failure was already
+            # published (and consumed) ahead of it in the queue; drop the
+            # rest, tear down, then raise the original exception object
             self._finalizer()
             raise outcome.error
         self._pump()
@@ -787,30 +944,67 @@ def _rowmap_worker(state_ref):
         job = state.job_queue.get()
         if job is _SENTINEL:
             return
-        if state.closing.is_set():
-            # teardown in progress: drop the job, no new rowmapper call
-            continue
-        index, row_number, record, attempt = job
         try:
-            outrow = state.rowmapper(record)
-            try:
-                if len(outrow) != state.nfields:
-                    error = ArgumentError(
-                        'rowmapper returned %d values for row %d but '
-                        'header has %d fields'
-                        % (len(outrow), row_number, state.nfields))
-                    error._petl_no_retry = True
-                    raise error
-            except TypeError:
-                error = ArgumentError(
-                    'rowmapper returned a non-sequence value for row %d: '
-                    '%r' % (row_number, outrow))
-                error._petl_no_retry = True
-                raise error
+            _process_job(state, job)
         except BaseException as error:
-            _handle_error(state, index, row_number, record, attempt, error)
+            # The per-job handlers cover rowmapper and all output handling;
+            # this is a last-resort guard against an unexpected internal
+            # error. Surface it to the caller instead of letting this thread
+            # die silently while the caller waits forever, then keep serving
+            # the queue (the next terminal state will wake the caller).
+            try:
+                index = job[0]
+            except Exception:
+                index = -1
+            _publish_failure(state, index, error)
+
+
+def _process_job(state, job):
+    index, row_number, record, attempt = job
+    if not _job_admitted(state, index):
+        # teardown in progress, or a terminal failure was determined
+        # before this call could start: never enter rowmapper
+        return
+    try:
+        outrow = state.rowmapper(record)
+    except BaseException as error:
+        _handle_error(state, index, row_number, record, attempt, error)
+        return
+    # Output handling is never retried. If the returned sequence's own
+    # ``__len__`` or iteration raises, the very same exception object is
+    # handed to the caller; only a genuinely non-sequence return value is
+    # reported as an ArgumentError carrying the row number.
+    try:
+        length = len(outrow)
+    except TypeError as error:
+        if hasattr(type(outrow), '__len__'):
+            # the sequence itself raised TypeError from ``__len__``:
+            # propagate that same exception object
+            _publish_failure(state, index, error)
         else:
-            state.results.put(_Success(index, tuple(outrow)))
+            error = ArgumentError(
+                'rowmapper returned a non-sequence value for row %d: '
+                '%r' % (row_number, outrow))
+            error._petl_no_retry = True
+            _publish_failure(state, index, error)
+        return
+    except BaseException as error:
+        _publish_failure(state, index, error)
+        return
+    if length != state.nfields:
+        error = ArgumentError(
+            'rowmapper returned %d values for row %d but '
+            'header has %d fields'
+            % (length, row_number, state.nfields))
+        error._petl_no_retry = True
+        _publish_failure(state, index, error)
+        return
+    try:
+        final_row = tuple(outrow)
+    except BaseException as error:
+        _publish_failure(state, index, error)
+        return
+    _publish_success(state, index, final_row)
 
 
 def _handle_error(state, index, row_number, record, attempt, error):
@@ -820,12 +1014,25 @@ def _handle_error(state, index, row_number, record, attempt, error):
             and not getattr(error, '_petl_no_retry', False) \
             and isinstance(error, state.retry_on) \
             and attempt < len(state.retry_delays) \
-            and not state.closing.is_set():
+            and not state.closing.is_set() \
+            and not _is_retry_excluded(state, index):
         delay = state.retry_delays[attempt]
         _schedule_retry(state, delay,
                         (index, row_number, record, attempt + 1))
     else:
-        state.results.put(_Failure(index, error))
+        _publish_failure(state, index, error)
+
+
+def _is_retry_excluded(state, index):
+    """A row at or after a determined failure boundary is never retried:
+    its retry is cancelled on the spot rather than waiting for its delay."""
+    with state.completion_lock:
+        if not state.failed.is_set():
+            return False
+        if state.ordered:
+            return state.boundary_index is not None \
+                and index >= state.boundary_index
+        return True
 
 
 def _schedule_retry(state, delay, job):
@@ -834,6 +1041,17 @@ def _schedule_retry(state, delay, job):
         state.retry_seq += 1
         heapq.heappush(state.retry_heap, (due, state.retry_seq, job))
         state.timer_cond.notify_all()
+    # A boundary may have been determined while this retry was being
+    # scheduled; if so it is excluded and is dropped immediately rather than
+    # waiting out its delay.
+    with state.completion_lock:
+        excluded = state.failed.is_set() and (
+            not state.ordered
+            or (state.boundary_index is not None
+                and job[0] >= state.boundary_index))
+        boundary = state.boundary_index
+    if excluded:
+        _prune_retries(state, -1 if not state.ordered else boundary)
 
 
 def _retry_timer(state_ref):
@@ -862,4 +1080,7 @@ def _retry_timer(state_ref):
         if state.closing.is_set():
             # cancelled while waiting: do not start the retry
             return
+        if not _job_admitted(state, job[0]):
+            # a boundary excluded this retry while it was waiting
+            continue
         state.job_queue.put(job)

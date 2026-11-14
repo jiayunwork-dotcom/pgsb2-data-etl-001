@@ -12,6 +12,13 @@ Unreleased
   with the original exception object, and guaranteed cleanup (including
   garbage collection of an abandoned iterator) with no worker threads left
   behind. The source table is only ever advanced in the caller thread.
+* Fix :func:`petl.transform.maps.rowmapconcurrent` so a terminal row failure
+  actually stops intake: rows after the failure boundary no longer enter
+  ``rowmapper``, results after the boundary are never delivered, boundary
+  retries are cancelled immediately, and cleanup waits for in-flight calls
+  without masking the original exception. Errors raised by a returned
+  sequence's own ``__len__``/iteration are propagated unchanged and never
+  retried.
 
 Version 1.7.32
 --------------
