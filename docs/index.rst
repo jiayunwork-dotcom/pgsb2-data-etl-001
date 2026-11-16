@@ -55,6 +55,7 @@ see the :ref:`genindex`.
    install
    intro
    io
+   missing
    transform
    util
    config

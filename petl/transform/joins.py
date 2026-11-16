@@ -5,11 +5,11 @@ import itertools
 from petl.comparison import Comparable, comparable_itemgetter
 from petl.compat import next, text_type
 from petl.errors import ArgumentError
+from petl.missing import key_contains_missing
 from petl.transform.basics import cut, cutout, stack
 from petl.transform.dedup import distinct
 from petl.transform.sorts import sort
 from petl.util.base import Table, asindices, data, header, rowgetter, rowgroupby
-
 
 def natural_key(left, right):
     # determine key field or fields
@@ -54,7 +54,8 @@ def _nonkey_indices(hdr, indices):
 
 
 def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
-         buffersize=None, tempdir=None, cache=True, lprefix=None, rprefix=None):
+         buffersize=None, tempdir=None, cache=True, lprefix=None,
+         rprefix=None, match_missing=False):
     """
     Perform an equi-join on the given tables. E.g.::
 
@@ -141,6 +142,15 @@ def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
     Left and right tables with different key fields can be handled via the
     `lkey` and `rkey` arguments.
 
+    If either side was read with ``preserve_missing=True``, key cells may
+    hold the :data:`petl.MISSING` marker for fields absent from the source.
+    By default (`match_missing=False`) any row whose key contains a MISSING
+    component can never match another row - not even a row whose key is
+    missing in the same positions - and is handled according to the outer
+    join semantics. Set `match_missing=True` to treat MISSING as equal only
+    to MISSING in the same key position; all other components keep their
+    normal equality rules and ``None`` keys are unaffected.
+
     .. versionchanged:: 1.7.16
         To ensure correct results for tables with uneven rows, tables will be
         squared up before joining to ensure correct results.
@@ -151,7 +161,8 @@ def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return JoinView(left, right, lkey=lkey, rkey=rkey,
                     presorted=presorted, buffersize=buffersize, tempdir=tempdir,
-                    cache=cache, lprefix=lprefix, rprefix=rprefix)
+                    cache=cache, lprefix=lprefix, rprefix=rprefix,
+                    match_missing=match_missing)
 
 
 Table.join = join
@@ -162,7 +173,7 @@ class JoinView(Table):
     def __init__(self, left, right, lkey, rkey,
                  presorted=False, leftouter=False, rightouter=False,
                  missing=None, buffersize=None, tempdir=None, cache=True,
-                 lprefix=None, rprefix=None):
+                 lprefix=None, rprefix=None, match_missing=False):
         self.lkey = lkey
         self.rkey = rkey
         self.left = stack(left, missing=missing)
@@ -177,17 +188,19 @@ class JoinView(Table):
         self.missing = missing
         self.lprefix = lprefix
         self.rprefix = rprefix
+        self.match_missing = match_missing
 
     def __iter__(self):
         return iterjoin(self.left, self.right, self.lkey, self.rkey,
                         leftouter=self.leftouter, rightouter=self.rightouter,
                         missing=self.missing, lprefix=self.lprefix,
-                        rprefix=self.rprefix)
+                        rprefix=self.rprefix,
+                        match_missing=self.match_missing)
 
 
 def leftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
              presorted=False, buffersize=None, tempdir=None, cache=True,
-             lprefix=None, rprefix=None):
+             lprefix=None, rprefix=None, match_missing=False):
     """
     Perform a left outer join on the given tables. E.g.::
 
@@ -232,7 +245,8 @@ def leftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     return JoinView(left, right, lkey=lkey, rkey=rkey,
                     presorted=presorted, leftouter=True, rightouter=False,
                     missing=missing, buffersize=buffersize, tempdir=tempdir,
-                    cache=cache, lprefix=lprefix, rprefix=rprefix)
+                    cache=cache, lprefix=lprefix, rprefix=rprefix,
+                    match_missing=match_missing)
 
 
 Table.leftjoin = leftjoin
@@ -240,7 +254,7 @@ Table.leftjoin = leftjoin
 
 def rightjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
               presorted=False, buffersize=None, tempdir=None, cache=True,
-              lprefix=None, rprefix=None):
+              lprefix=None, rprefix=None, match_missing=False):
     """
     Perform a right outer join on the given tables. E.g.::
 
@@ -286,7 +300,7 @@ def rightjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
                     presorted=presorted, leftouter=False, rightouter=True,
                     missing=missing, buffersize=buffersize,
                     tempdir=tempdir, cache=cache, lprefix=lprefix,
-                    rprefix=rprefix)
+                    rprefix=rprefix, match_missing=match_missing)
 
 
 Table.rightjoin = rightjoin
@@ -294,7 +308,7 @@ Table.rightjoin = rightjoin
 
 def outerjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
               presorted=False, buffersize=None, tempdir=None, cache=True,
-              lprefix=None, rprefix=None):
+              lprefix=None, rprefix=None, match_missing=False):
     """
     Perform a full outer join on the given tables. E.g.::
 
@@ -341,14 +355,15 @@ def outerjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     return JoinView(left, right, lkey=lkey, rkey=rkey,
                     presorted=presorted, leftouter=True, rightouter=True,
                     missing=missing, buffersize=buffersize, tempdir=tempdir,
-                    cache=cache, lprefix=lprefix, rprefix=rprefix)
+                    cache=cache, lprefix=lprefix, rprefix=rprefix,
+                    match_missing=match_missing)
 
 
 Table.outerjoin = outerjoin
 
 
 def iterjoin(left, right, lkey, rkey, leftouter=False, rightouter=False,
-             missing=None, lprefix=None, rprefix=None):
+             missing=None, lprefix=None, rprefix=None, match_missing=False):
     lit = iter(left)
     rit = iter(right)
 
@@ -414,58 +429,77 @@ def iterjoin(left, right, lkey, rkey, leftouter=False, rightouter=False,
     lrowgrp = []
     rrowgrp = []
 
-    # loop until *either* of the iterators is exhausted
+    # sentinel used only to distinguish "iterator exhausted" from a genuine
+    # key, since MISSING and None are both real key values
+    _END = object()
+
+    def _next_group(group_iter):
+        try:
+            return next(group_iter)
+        except StopIteration:
+            return _END, None
+
+    # loop until *both* of the iterators are exhausted
     # initialise here to handle empty tables
     lkval, rkval = Comparable(None), Comparable(None)
-    try:
+    lkval, lrowgrp = _next_group(lgit)
+    rkval, rrowgrp = _next_group(rgit)
 
-        # pick off initial row groups
-        lkval, lrowgrp = next(lgit)
-        rkval, rrowgrp = next(rgit)
-
-        while True:
-            if lkval < rkval:
-                if leftouter:
-                    for row in joinrows(lrowgrp, None):
-                        yield tuple(row)
-                # advance left
-                lkval, lrowgrp = next(lgit)
-            elif lkval > rkval:
-                if rightouter:
-                    for row in joinrows(None, rrowgrp):
-                        yield tuple(row)
-                # advance right
-                rkval, rrowgrp = next(rgit)
-            else:
-                for row in joinrows(lrowgrp, rrowgrp):
+    while lkval is not _END and rkval is not _END:
+        # When match_missing is off, a key containing any MISSING
+        # component is unmatchable: do not even compare it against the
+        # other side (no cartesian enumeration, no cross-side probing).
+        # Such a group is consumed once and emitted or dropped purely by
+        # the outer-join semantics, so work stays linear in the rows seen.
+        if not match_missing and key_contains_missing(lkval.inner):
+            if leftouter:
+                for row in joinrows(list(lrowgrp), None):
                     yield tuple(row)
-                # advance both
-                lkval, lrowgrp = next(lgit)
-                rkval, rrowgrp = next(rgit)
+            lkval, lrowgrp = _next_group(lgit)
+            continue
+        if not match_missing and key_contains_missing(rkval.inner):
+            if rightouter:
+                for row in joinrows(None, list(rrowgrp)):
+                    yield tuple(row)
+            rkval, rrowgrp = _next_group(rgit)
+            continue
 
-    except StopIteration:
-        pass
+        if lkval < rkval:
+            if leftouter:
+                for row in joinrows(list(lrowgrp), None):
+                    yield tuple(row)
+            # advance left
+            lkval, lrowgrp = _next_group(lgit)
+        elif lkval > rkval:
+            if rightouter:
+                for row in joinrows(None, list(rrowgrp)):
+                    yield tuple(row)
+            # advance right
+            rkval, rrowgrp = _next_group(rgit)
+        else:
+            for row in joinrows(list(lrowgrp), rrowgrp):
+                yield tuple(row)
+            # advance both
+            lkval, lrowgrp = _next_group(lgit)
+            rkval, rrowgrp = _next_group(rgit)
 
     # make sure any left rows remaining are yielded
     if leftouter:
-        if lkval > rkval:
-            # yield anything that got left hanging
-            for row in joinrows(lrowgrp, None):
+        if lkval is not _END:
+            # yield the group that got left hanging plus the rest
+            for row in joinrows(list(lrowgrp), None):
                 yield tuple(row)
-        # yield the rest
         for lkval, lrowgrp in lgit:
-            for row in joinrows(lrowgrp, None):
+            for row in joinrows(list(lrowgrp), None):
                 yield tuple(row)
 
     # make sure any right rows remaining are yielded
     if rightouter:
-        if lkval < rkval:
-            # yield anything that got left hanging
-            for row in joinrows(None, rrowgrp):
+        if rkval is not _END:
+            for row in joinrows(None, list(rrowgrp)):
                 yield tuple(row)
-        # yield the rest
         for rkval, rrowgrp in rgit:
-            for row in joinrows(None, rrowgrp):
+            for row in joinrows(None, list(rrowgrp)):
                 yield tuple(row)
 
 
@@ -541,7 +575,7 @@ def itercrossjoin(sources, prefix):
 
 
 def antijoin(left, right, key=None, lkey=None, rkey=None, presorted=False,
-             buffersize=None, tempdir=None, cache=True):
+             buffersize=None, tempdir=None, cache=True, match_missing=False):
     """
     Return rows from the `left` table where the key value does not occur in
     the `right` table. E.g.::
@@ -584,7 +618,8 @@ def antijoin(left, right, key=None, lkey=None, rkey=None, presorted=False,
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return AntiJoinView(left=left, right=right, lkey=lkey, rkey=rkey,
                         presorted=presorted, buffersize=buffersize,
-                        tempdir=tempdir, cache=cache)
+                        tempdir=tempdir, cache=cache,
+                        match_missing=match_missing)
 
 
 Table.antijoin = antijoin
@@ -593,7 +628,8 @@ Table.antijoin = antijoin
 class AntiJoinView(Table):
 
     def __init__(self, left, right, lkey, rkey, presorted=False,
-                 buffersize=None, tempdir=None, cache=True):
+                 buffersize=None, tempdir=None, cache=True,
+                 match_missing=False):
         if presorted:
             self.left = left
             self.right = right
@@ -604,12 +640,14 @@ class AntiJoinView(Table):
                               tempdir=tempdir, cache=cache)
         self.lkey = lkey
         self.rkey = rkey
+        self.match_missing = match_missing
 
     def __iter__(self):
-        return iterantijoin(self.left, self.right, self.lkey, self.rkey)
+        return iterantijoin(self.left, self.right, self.lkey, self.rkey,
+                            match_missing=self.match_missing)
 
 
-def iterantijoin(left, right, lkey, rkey):
+def iterantijoin(left, right, lkey, rkey, match_missing=False):
     lit = iter(left)
     rit = iter(right)
 
@@ -630,37 +668,45 @@ def iterantijoin(left, right, lkey, rkey):
     rgit = itertools.groupby(rit, key=rgetk)
     lrowgrp = []
 
+    _END = object()
+
+    def _next_group(group_iter):
+        try:
+            return next(group_iter)
+        except StopIteration:
+            return _END, None
+
     # loop until *either* of the iterators is exhausted
     lkval, rkval = Comparable(None), Comparable(None)
-    try:
+    lkval, lrowgrp = _next_group(lgit)
+    rkval, _ = _next_group(rgit)
 
-        # pick off initial row groups
-        lkval, lrowgrp = next(lgit)
-        rkval, _ = next(rgit)
+    while lkval is not _END and rkval is not _END:
+        # a MISSING-bearing key never matches unless match_missing is on,
+        # so the left group is always retained by the anti-join
+        if not match_missing and key_contains_missing(lkval.inner):
+            for row in lrowgrp:
+                yield tuple(row)
+            lkval, lrowgrp = _next_group(lgit)
+            continue
+        if lkval < rkval:
+            for row in lrowgrp:
+                yield tuple(row)
+            # advance left
+            lkval, lrowgrp = _next_group(lgit)
+        elif lkval > rkval:
+            # advance right
+            rkval, _ = _next_group(rgit)
+        else:
+            # advance both
+            lkval, lrowgrp = _next_group(lgit)
+            rkval, _ = _next_group(rgit)
 
-        while True:
-            if lkval < rkval:
-                for row in lrowgrp:
-                    yield tuple(row)
-                # advance left
-                lkval, lrowgrp = next(lgit)
-            elif lkval > rkval:
-                # advance right
-                rkval, _ = next(rgit)
-            else:
-                # advance both
-                lkval, lrowgrp = next(lgit)
-                rkval, _ = next(rgit)
-
-    except StopIteration:
-        pass
-
-    # any left over?
-    if lkval > rkval:
-        # yield anything that got left hanging
+    # any left over (including groups the right side never reached)?
+    if lkval is not _END:
+        # yield the group that got left hanging plus the remainder
         for row in lrowgrp:
             yield tuple(row)
-    # and the rest...
     for lkval, lrowgrp in lgit:
         for row in lrowgrp:
             yield tuple(row)
@@ -668,7 +714,7 @@ def iterantijoin(left, right, lkey, rkey):
 
 def lookupjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
                presorted=False, buffersize=None, tempdir=None, cache=True,
-               lprefix=None, rprefix=None):
+               lprefix=None, rprefix=None, match_missing=False):
     """
     Perform a left join, but where the key is not unique in the right-hand
     table, arbitrarily choose the first row and ignore others. E.g.::
@@ -709,7 +755,8 @@ def lookupjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     return LookupJoinView(left, right, lkey, rkey, presorted=presorted,
                           missing=missing, buffersize=buffersize,
                           tempdir=tempdir, cache=cache,
-                          lprefix=lprefix, rprefix=rprefix)
+                          lprefix=lprefix, rprefix=rprefix,
+                          match_missing=match_missing)
 
 
 Table.lookupjoin = lookupjoin
@@ -719,7 +766,7 @@ class LookupJoinView(Table):
 
     def __init__(self, left, right, lkey, rkey, presorted=False, missing=None,
                  buffersize=None, tempdir=None, cache=True,
-                 lprefix=None, rprefix=None):
+                 lprefix=None, rprefix=None, match_missing=False):
         self.left = stack(left, missing=missing)
         self.right = stack(right, missing=missing)
         if not presorted:
@@ -732,15 +779,17 @@ class LookupJoinView(Table):
         self.missing = missing
         self.lprefix = lprefix
         self.rprefix = rprefix
+        self.match_missing = match_missing
 
     def __iter__(self):
         return iterlookupjoin(self.left, self.right, self.lkey, self.rkey,
                               missing=self.missing, lprefix=self.lprefix,
-                              rprefix=self.rprefix)
+                              rprefix=self.rprefix,
+                              match_missing=self.match_missing)
 
 
 def iterlookupjoin(left, right, lkey, rkey, missing=None, lprefix=None,
-                   rprefix=None):
+                   rprefix=None, match_missing=False):
     lit = iter(left)
     rit = iter(right)
 
@@ -794,50 +843,48 @@ def iterlookupjoin(left, right, lkey, rkey, missing=None, lprefix=None,
     rgit = itertools.groupby(rit, key=rgetk)
     lrowgrp = []
 
-    # whether lrowgrp holds a group that has been picked off lgit but not yet
-    # yielded; tracked explicitly because no key value can stand in for
-    # "iterator exhausted" - None is itself a valid key
-    lgrp_pending = False
+    _END = object()
+
+    def _next_group(group_iter):
+        try:
+            return next(group_iter)
+        except StopIteration:
+            return _END, None
 
     # loop until *either* of the iterators is exhausted
-    try:
+    lkval, lrowgrp = _next_group(lgit)
+    rkval, rrowgrp = _next_group(rgit)
 
-        # pick off initial row groups
-        lkval, lrowgrp = next(lgit)
-        lgrp_pending = True
-        rkval, rrowgrp = next(rgit)
+    while lkval is not _END and rkval is not _END:
+        # MISSING-bearing keys never find a right row unless
+        # match_missing is enabled; emit the left-padded row once.
+        if not match_missing and key_contains_missing(lkval.inner):
+            for row in joinrows(list(lrowgrp), None):
+                yield tuple(row)
+            lkval, lrowgrp = _next_group(lgit)
+            continue
+        if lkval < rkval:
+            for row in joinrows(list(lrowgrp), None):
+                yield tuple(row)
+            # advance left
+            lkval, lrowgrp = _next_group(lgit)
+        elif lkval > rkval:
+            # advance right
+            rkval, rrowgrp = _next_group(rgit)
+        else:
+            for row in joinrows(list(lrowgrp), rrowgrp):
+                yield tuple(row)
+            # advance both
+            lkval, lrowgrp = _next_group(lgit)
+            rkval, rrowgrp = _next_group(rgit)
 
-        while True:
-            if lkval < rkval:
-                for row in joinrows(lrowgrp, None):
-                    yield tuple(row)
-                # advance left
-                lgrp_pending = False
-                lkval, lrowgrp = next(lgit)
-                lgrp_pending = True
-            elif lkval > rkval:
-                # advance right
-                rkval, rrowgrp = next(rgit)
-            else:
-                for row in joinrows(lrowgrp, rrowgrp):
-                    yield tuple(row)
-                # advance both
-                lgrp_pending = False
-                lkval, lrowgrp = next(lgit)
-                lgrp_pending = True
-                rkval, rrowgrp = next(rgit)
-
-    except StopIteration:
-        pass
-
-    # make sure any left rows remaining are yielded
-    if lgrp_pending:
-        # yield anything that got left hanging
-        for row in joinrows(lrowgrp, None):
+    # make sure any left rows remaining are yielded (lookup join is always
+    # left-outer); the last picked-off group plus anything left in the pipe
+    if lkval is not _END:
+        for row in joinrows(list(lrowgrp), None):
             yield tuple(row)
-    # yield the rest
     for lkval, lrowgrp in lgit:
-        for row in joinrows(lrowgrp, None):
+        for row in joinrows(list(lrowgrp), None):
             yield tuple(row)
 
 

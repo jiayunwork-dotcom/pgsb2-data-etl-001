@@ -4,6 +4,22 @@ Changes
 Unreleased
 ----------
 
+* Add the public :data:`petl.MISSING` singleton for fields absent from the
+  source record, distinct from an explicit ``null``/``None``. The marker is
+  hashable, stable under copy and pickle (including separate processes and
+  external-sort chunk files), and never equal to the string ``"MISSING"``.
+  :func:`petl.io.json.fromdicts` and :func:`petl.io.json.fromjson` accept
+  ``preserve_missing=True`` to emit the marker for absent keys while keeping
+  explicit nulls as ``None``; :func:`petl.io.json.tojson` accepts
+  ``omit_missing=True`` to omit marker cells (raising :class:`TypeError`
+  otherwise instead of silently writing null). :func:`petl.sort` orders
+  ``MISSING`` before ``None``. The sorted and hash joins accept
+  ``match_missing``: by default any key containing a marker is unmatchable
+  (two missing sides never pair) with O(N + M) decision work, while ``True``
+  matches markers only in the same key position. Outer-join ``missing``
+  fill values may themselves be ``petl.MISSING`` and never overwrite
+  genuinely absent cells. See :doc:`missing`.
+
 * Add :func:`petl.io.csvcheckpoint.fromcsvcheckpoint`, a Python 3-only,
   resumable CSV reader.  Each iteration is an independent cursor that can
   publish a JSON-serialisable checkpoint after the header and after every

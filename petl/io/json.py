@@ -12,7 +12,9 @@ from tempfile import NamedTemporaryFile
 
 from petl.compat import PY2
 from petl.compat import pickle
+from petl.errors import ArgumentError
 from petl.io.sources import read_source_from_arg, write_source_from_arg
+from petl.missing import MISSING
 # internal dependencies
 from petl.util.base import data, Table, dicts as _dicts
 
@@ -89,6 +91,12 @@ def fromjson(source, *args, **kwargs):
     via :func:`json.load` and select the array to treat as the data, see also
     :func:`petl.io.json.fromdicts`.
 
+    Set `preserve_missing` to ``True`` to distinguish an object that omits a
+    key from one that carries an explicit ``null``: missing keys become the
+    :data:`petl.MISSING` marker while explicit ``null`` values stay ``None``.
+    Enabling `preserve_missing` together with a non-``None`` `missing`
+    argument raises :class:`petl.errors.ArgumentError`.
+
     .. versionchanged:: 1.1.0
 
     If no `header` is specified, fields will be discovered by sampling keys
@@ -112,6 +120,12 @@ class JsonView(Table):
     def __init__(self, source, *args, **kwargs):
         self.source = source
         self.missing = kwargs.pop('missing', None)
+        self.preserve_missing = kwargs.pop('preserve_missing', False)
+        if self.preserve_missing and self.missing is not None:
+            raise ArgumentError(
+                'preserve_missing cannot be combined with a non-None missing '
+                'argument'
+            )
         self._header = kwargs.pop('header', None)
         self.sample = kwargs.pop('sample', 1000)
         self.lines = kwargs.pop('lines', False)
@@ -129,19 +143,22 @@ class JsonView(Table):
             try:
                 if self.lines:
                     for row in iterjlines(f, self._header, self.missing,
-                                         self.args, self.kwargs):
+                                         self.args, self.kwargs,
+                                         preserve_missing=self.preserve_missing):
                         yield row
                 else:
                     dicts = json.load(f, *self.args, **self.kwargs)
                     for row in iterdicts(dicts, self._header, self.sample,
-                                         self.missing):
+                                         self.missing,
+                                         preserve_missing=self.preserve_missing):
                         yield row
             finally:
                 if not PY2:
                     f.detach()
 
 
-def fromdicts(dicts, header=None, sample=1000, missing=None):
+def fromdicts(dicts, header=None, sample=1000, missing=None,
+              preserve_missing=False):
     """
     View a sequence of Python :class:`dict` as a table. E.g.::
 
@@ -190,6 +207,15 @@ def fromdicts(dicts, header=None, sample=1000, missing=None):
     inputs produce an empty header and no data rows, including with
     `sample=1`.
 
+    Set `preserve_missing` to ``True`` to keep the difference between a
+    dictionary that lacks a key and one that holds an explicit ``None``:
+    absent keys are emitted as the :data:`petl.MISSING` marker, explicit
+    ``None`` values stay ``None`` and every other value is passed through
+    unchanged. Because a missing field would otherwise be filled with the
+    `missing` argument, combining `preserve_missing=True` with a non-``None``
+    `missing` raises :class:`petl.errors.ArgumentError`. Header discovery via
+    `sample` and the treatment of unknown fields are unchanged.
+
     See also :func:`petl.io.json.fromjson`.
 
     .. versionchanged:: 1.1.0
@@ -213,8 +239,14 @@ def fromdicts(dicts, header=None, sample=1000, missing=None):
     instead of `itertools.tee` due to high memory usage.
 
     """
+    if preserve_missing and missing is not None:
+        raise ArgumentError(
+            'preserve_missing cannot be combined with a non-None missing '
+            'argument'
+        )
     view = DictsGeneratorView if inspect.isgenerator(dicts) else DictsView
-    return view(dicts, header=header, sample=sample, missing=missing)
+    return view(dicts, header=header, sample=sample, missing=missing,
+                preserve_missing=preserve_missing)
 
 
 class _DictsAttr(object):
@@ -264,16 +296,20 @@ class _DictsAttr(object):
 
 class DictsView(Table):
 
-    def __init__(self, dicts, header=None, sample=1000, missing=None):
+    def __init__(self, dicts, header=None, sample=1000, missing=None,
+                 preserve_missing=False):
         self._dicts = dicts
         self._header = header
         self.sample = sample
         self.missing = missing
+        self.preserve_missing = preserve_missing
 
     def __iter__(self):
         if self._header is not None:
             self._header = tuple(self._header)
-        for row in iterdicts(self._dicts, self._header, self.sample, self.missing):  # noqa: UP028 - Python 2 compatibility
+        for row in iterdicts(self._dicts, self._header, self.sample,
+                             self.missing,
+                             preserve_missing=self.preserve_missing):
             yield row
 
     @property
@@ -290,8 +326,11 @@ class DictsView(Table):
 
 class DictsGeneratorView(DictsView):
 
-    def __init__(self, dicts, header=None, sample=1000, missing=None):
-        super(DictsGeneratorView, self).__init__(dicts, header, sample, missing)
+    def __init__(self, dicts, header=None, sample=1000, missing=None,
+                 preserve_missing=False):
+        super(DictsGeneratorView, self).__init__(
+            dicts, header, sample, missing, preserve_missing
+        )
         self._filecache = None
         self._cached = 0
 
@@ -321,7 +360,9 @@ class DictsGeneratorView(DictsView):
                 o = next(it)
             except StopIteration:
                 break
-            row = tuple(o.get(f, self.missing) for f in self._header)
+            row = tuple(_dict_cell(o, f, self.missing,
+                                   self.preserve_missing)
+                        for f in self._header)
             self._filecache.seek(self._cached)
             pickle.dump(row, self._filecache, protocol=-1)
             self._cached = position = self._filecache.tell()
@@ -345,7 +386,22 @@ class DictsGeneratorView(DictsView):
             unlink(self._filecache.name)
 
 
-def iterjlines(f, header, missing, args=(), kwargs=None):
+def _dict_cell(o, field, missing, preserve_missing):
+    """Extract one cell from a source dictionary.
+
+    With `preserve_missing`, an absent key yields the MISSING marker while an
+    explicit ``None`` is returned unchanged. Otherwise the historical
+    ``dict.get(field, missing)`` behaviour is preserved.
+    """
+    if preserve_missing:
+        if field in o:
+            return o[field]
+        return MISSING
+    return o.get(field, missing)
+
+
+def iterjlines(f, header, missing, args=(), kwargs=None,
+               preserve_missing=False):
     if kwargs is None:
         kwargs = {}
     it = iter(f)
@@ -365,10 +421,11 @@ def iterjlines(f, header, missing, args=(), kwargs=None):
     yield tuple(header)
 
     for json_obj in chain(first, (json.loads(o, *args, **kwargs) for o in it)):
-        yield tuple(json_obj[f] if f in json_obj else missing for f in header)
+        yield tuple(_dict_cell(json_obj, f, missing, preserve_missing)
+                    for f in header)
 
 
-def iterdicts(dicts, header, sample, missing):
+def iterdicts(dicts, header, sample, missing, preserve_missing=False):
     it = iter(dicts)
 
     # determine header row
@@ -384,10 +441,12 @@ def iterdicts(dicts, header, sample, missing):
 
     # generate data rows
     for o in it:
-        yield tuple(o.get(f, missing) for f in header)
+        yield tuple(_dict_cell(o, f, missing, preserve_missing)
+                    for f in header)
 
 
-def tojson(table, source=None, prefix=None, suffix=None, *args, **kwargs):
+def tojson(table, source=None, prefix=None, suffix=None, omit_missing=False,
+           *args, **kwargs):
     """
     Write a table in JSON format, with rows output as JSON objects. E.g.::
 
@@ -421,16 +480,58 @@ def tojson(table, source=None, prefix=None, suffix=None, *args, **kwargs):
         {"name": "May", "wins": []}
         {"name": "Deloise", "wins": [["three of a kind", "5S"]]}
 
+    Set `omit_missing` to ``True`` to round-trip sparse tables read with
+    ``preserve_missing=True``: cells holding the :data:`petl.MISSING` marker
+    are left out of the output object, while explicit ``None`` cells are
+    still written as ``null`` and every other value uses the normal JSON
+    encoding. Both array and JSON lines output support this. If
+    `omit_missing` is left at its default and a MISSING cell is encountered,
+    a :class:`TypeError` is raised rather than silently writing ``null`` or
+    the string ``"MISSING"``.
+
     Note that this is currently not streaming, all data is loaded into memory
     before being written to the file.
 
     """
 
-    obj = [row for row in _dicts(table)]
+    obj = [_json_object(hdr, row, omit_missing)
+           for hdr, row in _iter_json_objects(table)]
     _writejson(source, obj, prefix, suffix, *args, **kwargs)
 
 
 Table.tojson = tojson
+
+
+def _iter_json_objects(table):
+    """Yield ``(header, row)`` pairs for each data row of `table`."""
+    it = iter(table)
+    try:
+        hdr = next(it)
+    except StopIteration:
+        return
+    for row in it:
+        yield hdr, row
+
+
+def _json_object(hdr, row, omit_missing):
+    """Build a plain dict for one row, honouring the MISSING contract."""
+    obj = dict()
+    for i, f in enumerate(hdr):
+        if i < len(row):
+            value = row[i]
+        else:
+            # match the historical short-row behaviour of Table.dicts()
+            value = None
+        if value is MISSING:
+            if omit_missing:
+                continue
+            raise TypeError(
+                'petl.MISSING value for field %r cannot be encoded as JSON; '
+                'use tojson(..., omit_missing=True) to omit the key'
+                % (f,)
+            )
+        obj[f] = value
+    return obj
 
 
 def tojsonarrays(table, source=None, prefix=None, suffix=None,

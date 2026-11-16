@@ -5,6 +5,7 @@ import operator
 from functools import partial
 
 from petl.compat import text_type, binary_type, numeric_types
+from petl.missing import MISSING
 
 
 class Comparable(object):
@@ -33,7 +34,15 @@ class Comparable(object):
         if isinstance(other, Comparable):
             other = other.obj
 
-        # None < everything else
+        # MISSING < everything else, including None; only MISSING equals
+        # MISSING. Note equality is handled by __eq__, which keeps the
+        # marker's identity semantics, so here MISSING < MISSING is False.
+        if obj is MISSING:
+            return other is not MISSING
+        if other is MISSING:
+            return False
+
+        # None < everything else (except MISSING)
         if other is None:
             return False
         if obj is None:
