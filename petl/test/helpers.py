@@ -1,7 +1,10 @@
 from __future__ import absolute_import, print_function, division
 
+import math
 import os
 import sys
+from collections import Counter
+from decimal import Decimal
 
 import pytest
 
@@ -65,6 +68,37 @@ def ieq2(expect, actual, cast=None):
     """Test when iterables values are equals twice looking for side effects"""
     ieq(expect, actual, cast)
     ieq(expect, actual, cast)
+
+
+def nan_token(cell):
+    """Return a canonical, comparable token for a NaN cell value.
+
+    NaN cells are identified by category (float vs Decimal), sign and -
+    for Decimal - payload, so tests can assert that NaN values travelled
+    the data paths unchanged without ever relying on NaN == NaN. Any
+    non-NaN value is returned unchanged.
+    """
+    if isinstance(cell, float) and cell != cell:
+        return ('_NAN_', 'float', math.copysign(1.0, cell) < 0.0)
+    if isinstance(cell, Decimal) and cell.is_qnan():
+        return ('_NAN_', 'decimal', cell.is_signed(), cell.as_tuple().digits)
+    return cell
+
+
+def canonical_rows(rows):
+    """Materialise rows, replacing NaN cells with canonical tokens."""
+    return [tuple(nan_token(cell) for cell in row) for row in rows]
+
+
+def ieq_nan(expect, actual):
+    """Like :func:`ieq`, but NaN cells compare by category, sign and payload."""
+    ieq(canonical_rows(expect), canonical_rows(actual))
+
+
+def row_multiset(rows):
+    """Canonical-row multiset, for order-independent comparison with
+    exact duplicate counts."""
+    return Counter(canonical_rows(rows))
 
 
 def get_env_vars_named(prefix, remove_prefix=True):

@@ -56,6 +56,7 @@ see the :ref:`genindex`.
    intro
    io
    missing
+   nan
    transform
    util
    config

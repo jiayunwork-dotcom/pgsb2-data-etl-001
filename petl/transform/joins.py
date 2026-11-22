@@ -2,7 +2,7 @@ from __future__ import absolute_import, division, print_function
 
 import itertools
 
-from petl.comparison import Comparable, comparable_itemgetter
+from petl.comparison import Comparable, comparable_itemgetter, key_contains_nan
 from petl.compat import next, text_type
 from petl.errors import ArgumentError
 from petl.missing import key_contains_missing
@@ -150,6 +150,15 @@ def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
     join semantics. Set `match_missing=True` to treat MISSING as equal only
     to MISSING in the same key position; all other components keep their
     normal equality rules and ``None`` keys are unaffected.
+
+    A key containing a NaN value (float NaN or Decimal quiet NaN, in any
+    key component for compound keys) can never match another row, not
+    even a row carrying the identical NaN object, because NaN is not
+    equal to anything. This holds regardless of `match_missing`. Under
+    the sort order NaN keys are mutually co-equal and sort after ``None``
+    and before all other values, so `presorted=True` input should be
+    prepared with NaN keys in that position; co-equal keys keep their
+    input order. NaN values in non-key fields do not affect matching.
 
     .. versionchanged:: 1.7.16
         To ensure correct results for tables with uneven rows, tables will be
@@ -446,18 +455,24 @@ def iterjoin(left, right, lkey, rkey, leftouter=False, rightouter=False,
     rkval, rrowgrp = _next_group(rgit)
 
     while lkval is not _END and rkval is not _END:
-        # When match_missing is off, a key containing any MISSING
-        # component is unmatchable: do not even compare it against the
-        # other side (no cartesian enumeration, no cross-side probing).
-        # Such a group is consumed once and emitted or dropped purely by
-        # the outer-join semantics, so work stays linear in the rows seen.
-        if not match_missing and key_contains_missing(lkval.inner):
+        # A key containing any NaN component is never matchable - NaN is
+        # not equal to anything, not even another NaN - no matter what
+        # match_missing says. Likewise, when match_missing is off, a key
+        # containing any MISSING component is unmatchable. Such groups
+        # are consumed one side at a time and emitted or dropped purely
+        # by the outer-join semantics: they are never compared against
+        # the other side, so with N and M unmatchable rows the decision
+        # work stays O(N + M) and no cartesian enumeration of candidate
+        # pairs is ever built and discarded.
+        if key_contains_nan(lkval.inner) \
+                or (not match_missing and key_contains_missing(lkval.inner)):
             if leftouter:
                 for row in joinrows(list(lrowgrp), None):
                     yield tuple(row)
             lkval, lrowgrp = _next_group(lgit)
             continue
-        if not match_missing and key_contains_missing(rkval.inner):
+        if key_contains_nan(rkval.inner) \
+                or (not match_missing and key_contains_missing(rkval.inner)):
             if rightouter:
                 for row in joinrows(None, list(rrowgrp)):
                     yield tuple(row)
@@ -682,9 +697,11 @@ def iterantijoin(left, right, lkey, rkey, match_missing=False):
     rkval, _ = _next_group(rgit)
 
     while lkval is not _END and rkval is not _END:
-        # a MISSING-bearing key never matches unless match_missing is on,
-        # so the left group is always retained by the anti-join
-        if not match_missing and key_contains_missing(lkval.inner):
+        # a NaN-bearing key never matches anything, and a MISSING-bearing
+        # key never matches unless match_missing is on, so the left group
+        # is always retained by the anti-join
+        if key_contains_nan(lkval.inner) \
+                or (not match_missing and key_contains_missing(lkval.inner)):
             for row in lrowgrp:
                 yield tuple(row)
             lkval, lrowgrp = _next_group(lgit)
@@ -856,9 +873,11 @@ def iterlookupjoin(left, right, lkey, rkey, missing=None, lprefix=None,
     rkval, rrowgrp = _next_group(rgit)
 
     while lkval is not _END and rkval is not _END:
-        # MISSING-bearing keys never find a right row unless
-        # match_missing is enabled; emit the left-padded row once.
-        if not match_missing and key_contains_missing(lkval.inner):
+        # NaN-bearing keys never find a right row, and MISSING-bearing
+        # keys never find one unless match_missing is enabled; emit the
+        # left-padded row once, without comparing against the other side.
+        if key_contains_nan(lkval.inner) \
+                or (not match_missing and key_contains_missing(lkval.inner)):
             for row in joinrows(list(lrowgrp), None):
                 yield tuple(row)
             lkval, lrowgrp = _next_group(lgit)

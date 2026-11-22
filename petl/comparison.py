@@ -2,10 +2,51 @@ from __future__ import absolute_import, print_function, division
 
 
 import operator
+from decimal import Decimal
 from functools import partial
 
 from petl.compat import text_type, binary_type, numeric_types
 from petl.missing import MISSING
+
+
+def _isnan(obj):
+    """Return True for the NaN values petl treats as unmatchable: Python
+    float NaN and Decimal quiet NaN (either sign, any payload). Signaling
+    NaN and all other values return False.
+
+    The checks are deliberately quiet: no arithmetic or comparison is
+    performed on Decimal operands, so the caller's decimal context (trap
+    settings and status flags) is never consulted or modified.
+    """
+    # float first - cheap and the common case; ``obj != obj`` is quiet
+    if isinstance(obj, float):
+        return obj != obj
+    # Decimal quiet NaN only; is_qnan() does not touch the decimal context
+    if isinstance(obj, Decimal):
+        return obj.is_qnan()
+    return False
+
+
+def key_contains_nan(key):
+    """Return True if a (possibly compound) join/sort key holds a NaN value.
+
+    `key` is either a bare cell value or a tuple of cell values, matching
+    the keys produced by :func:`operator.itemgetter`. NaN means float NaN
+    or Decimal quiet NaN (either sign, any payload); see :func:`_isnan`.
+
+    A key containing a NaN component can never match another key in a
+    join, because NaN is not equal to anything - not even to itself or
+    to the identical NaN object. This is the relational-matching rule,
+    which is deliberately distinct from the sort order (under which all
+    NaN values are mutually co-equal, see :class:`Comparable`).
+    """
+    if _isnan(key):
+        return True
+    if isinstance(key, tuple):
+        for component in key:
+            if _isnan(component):
+                return True
+    return False
 
 
 class Comparable(object):
@@ -15,9 +56,17 @@ class Comparable(object):
     the `None` value (for example, the date and time objects from the standard
     library cannot be directly compared with `None` in Python 2).
 
+    The ascending sort order is: :data:`petl.MISSING`, then `None`, then
+    NaN values (float NaN and Decimal quiet NaN, all mutually co-equal
+    regardless of category, sign or payload), then everything else under
+    the relaxed rules. Co-equal NaN values keep their input order (the
+    sort is stable). Note that co-equal for sorting does **not** mean
+    matchable: joins treat any key containing a NaN component as never
+    equal to another key - see :func:`key_contains_nan`.
+
     """
 
-    __slots__ = ['obj', 'inner']
+    __slots__ = ['obj', 'inner', 'isnan']
 
     def __init__(self, obj):
         # store wrapped object unchanged
@@ -25,14 +74,26 @@ class Comparable(object):
         # handle lists and tuples
         if isinstance(obj, (list, tuple)):
             obj = tuple(Comparable(o) for o in obj)
+            # a container is never itself NaN; any NaN components carry
+            # their own flag on the wrapped components
+            self.isnan = False
+        else:
+            # cache NaN-ness once per wrapped value: sorting performs
+            # O(n log n) comparisons per key and compound keys re-compare
+            # components repeatedly, so this must be cheap to read
+            self.isnan = _isnan(obj)
         self.obj = obj
 
     def __lt__(self, other):
 
         # convenience
         obj = self.obj
+        obj_isnan = self.isnan
         if isinstance(other, Comparable):
+            other_isnan = other.isnan
             other = other.obj
+        else:
+            other_isnan = _isnan(other)
 
         # MISSING < everything else, including None; only MISSING equals
         # MISSING. Note equality is handled by __eq__, which keeps the
@@ -47,6 +108,14 @@ class Comparable(object):
             return False
         if obj is None:
             return True
+
+        # NaN < everything else (except MISSING and None); any two NaN
+        # values are mutually co-equal for ordering. This check must come
+        # before any native comparison: ``Decimal('NaN') < x`` raises
+        # InvalidOperation under the default decimal context, and native
+        # ``nan < x`` is always False, which would not give a total order.
+        if obj_isnan or other_isnan:
+            return obj_isnan and not other_isnan
 
         # numbers < everything else (except None)
         if isinstance(obj, numeric_types) \
@@ -72,7 +141,17 @@ class Comparable(object):
 
     def __eq__(self, other):
         if isinstance(other, Comparable):
-            return self.obj == other.obj
+            other = other.obj
+        # NaN values are co-equal under the sort order (any category,
+        # sign or payload), so the stability machinery - the heapq.merge
+        # order tie-break, max() first-win in the reverse merge, and
+        # itertools.groupby - sees a consistent total preorder. This is
+        # deliberately NOT the join-matching rule: joins never match NaN
+        # keys (see key_contains_nan). The check also keeps Decimal NaN
+        # away from native ``<``/``>`` comparisons, which would raise
+        # InvalidOperation under the default decimal context.
+        if self.isnan:
+            return _isnan(other)
         return self.obj == other
 
     def __le__(self, other):

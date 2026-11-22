@@ -4,6 +4,23 @@ Changes
 Unreleased
 ----------
 
+* Give NaN key values (``float`` NaN and ``Decimal`` quiet NaN, either
+  sign, any payload) a defined sort order and a separate matching rule.
+  :func:`petl.sort` orders NaN after ``None`` and before all other values
+  with all NaNs mutually co-equal and stable (input order preserved),
+  component-wise for compound keys, and ``reverse=True`` inverts the
+  order while staying stable. The sorted joins
+  (:func:`petl.transform.joins.join` and its variants) and the hash joins
+  (:func:`petl.transform.hashjoins.hashjoin` and its variants) treat any
+  key containing a NaN component as never matching - not even the
+  identical NaN object, and regardless of ``match_missing`` - with
+  O(N + M) pairing-decision work and no N*M candidate enumeration. NaN in
+  non-key fields is carried through unchanged, output cells keep their
+  original values (category, sign and Decimal payload preserved, also
+  across external-sort spill files), and all NaN handling is quiet under
+  the caller's decimal context (traps and flags untouched). See
+  :doc:`nan`.
+
 * Add the public :data:`petl.MISSING` singleton for fields absent from the
   source record, distinct from an explicit ``null``/``None``. The marker is
   hashable, stable under copy and pickle (including separate processes and

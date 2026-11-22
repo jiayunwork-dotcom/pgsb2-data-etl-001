@@ -105,6 +105,14 @@ def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
 
     The `buffersize` argument should be an `int` or `None`.
 
+    The ascending order places :data:`petl.MISSING` first, then ``None``,
+    then NaN values (float NaN and Decimal quiet NaN, all mutually
+    co-equal regardless of sign or payload), then everything else under
+    the relaxed comparison rules. Co-equal keys keep their input order
+    (the sort is stable, also with ``reverse=True`` and through the
+    external merge). Note that co-equal for sorting does not imply
+    matchable: joins never match NaN keys - see :doc:`nan`.
+
     If the number of rows in the table is less than `buffersize`, the table
     will be sorted in memory. Otherwise, the table is sorted in chunks of
     no more than `buffersize` rows, each chunk is written to a temporary file,

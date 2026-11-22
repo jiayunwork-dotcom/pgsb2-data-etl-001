@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, print_function
 import operator
 
 from petl.compat import next, text_type
+from petl.comparison import key_contains_nan
 from petl.missing import key_contains_missing
 from petl.transform.basics import stack
 from petl.transform.joins import keys_from_args, _nonkey_indices
@@ -74,6 +75,12 @@ def hashjoin(left, right, key=None, lkey=None, rkey=None, cache=True,
     :data:`petl.MISSING` never matches anything, while ``True`` makes
     MISSING equal only to MISSING in the same key position. ``None`` keys
     are unaffected either way.
+
+    A key containing a NaN value (float NaN or Decimal quiet NaN, in any
+    key component) never matches anything - not even the identical NaN
+    object - regardless of `match_missing`; such rows are dropped by the
+    inner join and padded by the outer variants without ever probing the
+    lookup. NaN values in non-key fields do not affect matching.
 
     .. versionchanged:: 1.7.16
         To ensure correct results for tables with uneven rows, tables will be
@@ -157,9 +164,13 @@ def iterhashjoin(left, right, lkey, rkey, rlookup, lprefix, rprefix,
 
     for lrow in lit:
         k = lgetk(lrow)
-        # MISSING components are unmatchable unless explicitly enabled;
-        # skip the probe entirely instead of risk a hash collision match.
-        if not match_missing and key_contains_missing(k):
+        # NaN keys never match anything - not even the identical NaN
+        # object, which a dict probe would find via the interpreter's
+        # identity fast path - and MISSING components are unmatchable
+        # unless explicitly enabled; skip the probe entirely instead of
+        # risking a hash collision or identity match.
+        if key_contains_nan(k) \
+                or (not match_missing and key_contains_missing(k)):
             continue
         if k in rlookup:
             rrows = rlookup[k]
@@ -267,8 +278,11 @@ def iterhashleftjoin(left, right, lkey, rkey, missing, rlookup, lprefix,
     for lrow in lit:
         k = lgetk(lrow)
         # without match_missing a MISSING-bearing key is always unmatched,
-        # so emit the left-padded outer row directly (no lookup probe)
-        if (not match_missing and key_contains_missing(k)) or k not in rlookup:
+        # and a NaN-bearing key is always unmatched regardless, so emit
+        # the left-padded outer row directly (no lookup probe)
+        if key_contains_nan(k) \
+                or (not match_missing and key_contains_missing(k)) \
+                or k not in rlookup:
             outrow = list(lrow)  # start with the left row
             # extend with missing values in place of the right row
             outrow.extend([missing] * len(rvind))
@@ -379,10 +393,12 @@ def iterhashrightjoin(left, right, lkey, rkey, missing, llookup, lprefix,
 
     for rrow in rit:
         k = rgetk(rrow)
-        # a MISSING-bearing right key can only match when match_missing is
-        # on; otherwise the row is emitted as a right-only outer row and
-        # its key cells (MISSING included) are back-filled unchanged
-        if (not match_missing and key_contains_missing(k)) \
+        # a NaN-bearing right key can never match, and a MISSING-bearing
+        # right key can only match when match_missing is on; otherwise
+        # the row is emitted as a right-only outer row and its key cells
+        # (NaN/MISSING included) are back-filled unchanged
+        if key_contains_nan(k) \
+                or (not match_missing and key_contains_missing(k)) \
                 or k not in llookup:
             # start with missing values in place of the left row
             outrow = [missing] * len(lhdr)
@@ -462,7 +478,11 @@ def iterhashantijoin(left, right, lkey, rkey, match_missing=False):
 
     for lrow in lit:
         lk = lgetk(lrow)
-        if not match_missing and key_contains_missing(lk):
+        if key_contains_nan(lk):
+            # NaN keys are unmatchable by contract, so the anti-join
+            # keeps the row (no probe against the right key set)
+            yield tuple(lrow)
+        elif not match_missing and key_contains_missing(lk):
             # unmatchable by contract, so the anti-join keeps the row
             yield tuple(lrow)
         elif lk not in rkeys:
@@ -559,7 +579,9 @@ def iterhashlookupjoin(left, right, lkey, rkey, missing, lprefix, rprefix,
 
     for lrow in lit:
         k = lgetk(lrow)
-        if (not match_missing and key_contains_missing(k)) or k not in rlookup:
+        if key_contains_nan(k) \
+                or (not match_missing and key_contains_missing(k)) \
+                or k not in rlookup:
             outrow = list(lrow)  # start with the left row
             # extend with missing values in place of the right row
             outrow.extend([missing] * len(rvind))
